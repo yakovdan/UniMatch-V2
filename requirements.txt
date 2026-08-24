@@ -2,6 +2,7 @@ pyyaml>=5.4.0
 easydict
 TensorBoardX
 tensorboard
+wandb
 opencv-python
 scipy
 scikit-learn

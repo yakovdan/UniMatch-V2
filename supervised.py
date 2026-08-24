@@ -12,7 +12,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 import yaml
 
 from dataset.semi import SemiDataset
@@ -117,10 +117,29 @@ def main():
     if rank == 0:
         all_args = {**cfg, **vars(args), 'ngpus': world_size}
         logger.info('{}\n'.format(pprint.pformat(all_args)))
-        
-        writer = SummaryWriter(args.save_path)
-        
+
         os.makedirs(args.save_path, exist_ok=True)
+
+        # mode precedence: USE_WANDB env var > wandb_mode in the config > online
+        wandb_mode = os.environ.get('USE_WANDB', cfg.get('wandb_mode', 'online'))
+        if wandb_mode not in ('online', 'offline', 'disabled'):
+            raise ValueError(f"invalid wandb mode '{wandb_mode}' (from USE_WANDB or wandb_mode config); "
+                             f"expected 'online', 'offline' or 'disabled'")
+
+        save_path = os.path.normpath(args.save_path)
+        run_name = os.path.relpath(save_path, 'exp') if save_path.split(os.sep)[0] == 'exp' else save_path
+        wandb.init(
+            project=os.environ.get('WANDB_PROJECT', 'unimatch-v2'),
+            name=run_name,
+            config=all_args,
+            dir=args.save_path,
+            mode=wandb_mode
+        )
+        # train/* and eval/* are logged on different clocks (iterations vs epochs)
+        wandb.define_metric('iters')
+        wandb.define_metric('epoch')
+        wandb.define_metric('train/*', step_metric='iters')
+        wandb.define_metric('eval/*', step_metric='epoch')
     
     cudnn.enabled = True
     cudnn.benchmark = True
@@ -232,8 +251,11 @@ def main():
             optimizer.param_groups[1]["lr"] = lr * cfg['lr_multi']
             
             if rank == 0:
-                writer.add_scalar('train/loss_all', loss.item(), iters)
-                writer.add_scalar('train/loss_x', loss.item(), iters)
+                wandb.log({
+                    'train/loss_all': loss.item(),
+                    'train/loss_x': loss.item(),
+                    'iters': iters
+                })
             
             if (i % (len(trainloader) // 8) == 0) and (rank == 0):
                 logger.info('Iters: {:}, Total loss: {:.3f}'.format(i, total_loss.avg))
@@ -247,9 +269,10 @@ def main():
                             'IoU: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou))
             logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
             
-            writer.add_scalar('eval/mIoU', mIoU, epoch)
+            eval_log = {'eval/mIoU': mIoU, 'epoch': epoch}
             for i, iou in enumerate(iou_class):
-                writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
+                eval_log['eval/%s_IoU' % (CLASSES[cfg['dataset']][i])] = iou
+            wandb.log(eval_log)
         
         is_best = mIoU > previous_best
         previous_best = max(mIoU, previous_best)
@@ -263,6 +286,9 @@ def main():
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
             if is_best:
                 torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+
+    if rank == 0:
+        wandb.finish()
 
 
 if __name__ == '__main__':

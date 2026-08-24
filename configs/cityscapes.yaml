@@ -21,3 +21,6 @@ conf_thresh: 0.95
 model: dpt
 backbone: dinov2_small
 lock_backbone: False
+
+# arguments for logging
+wandb_mode: online # online | offline | disabled; override with USE_WANDB env var

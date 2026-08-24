@@ -10,7 +10,7 @@ from torch import nn
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 import yaml
 
 from dataset.semi import SemiDataset
@@ -73,9 +73,28 @@ def main():
     all_args = {**cfg, **vars(args), 'ngpus': world_size, 'accum_steps': accum}
     logger.info('{}\n'.format(pprint.pformat(all_args)))
 
-    writer = SummaryWriter(args.save_path)
-
     os.makedirs(args.save_path, exist_ok=True)
+
+    # mode precedence: USE_WANDB env var > wandb_mode in the config > online
+    wandb_mode = os.environ.get('USE_WANDB', cfg.get('wandb_mode', 'online'))
+    if wandb_mode not in ('online', 'offline', 'disabled'):
+        raise ValueError(f"invalid wandb mode '{wandb_mode}' (from USE_WANDB or wandb_mode config); "
+                         f"expected 'online', 'offline' or 'disabled'")
+
+    save_path = os.path.normpath(args.save_path)
+    run_name = os.path.relpath(save_path, 'exp') if save_path.split(os.sep)[0] == 'exp' else save_path
+    wandb.init(
+        project=os.environ.get('WANDB_PROJECT', 'unimatch-v2'),
+        name=run_name,
+        config=all_args,
+        dir=args.save_path,
+        mode=wandb_mode
+    )
+    # train/* and eval/* are logged on different clocks (optimizer steps vs epochs)
+    wandb.define_metric('iters')
+    wandb.define_metric('epoch')
+    wandb.define_metric('train/*', step_metric='iters')
+    wandb.define_metric('eval/*', step_metric='epoch')
 
     cudnn.enabled = True
     cudnn.benchmark = True
@@ -256,10 +275,13 @@ def main():
             for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
                 buffer_ema.copy_(buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio))
 
-            writer.add_scalar('train/loss_all', group_loss, iters)
-            writer.add_scalar('train/loss_x', group_loss_x, iters)
-            writer.add_scalar('train/loss_s', group_loss_s, iters)
-            writer.add_scalar('train/mask_ratio', total_mask_ratio.val, iters)
+            wandb.log({
+                'train/loss_all': group_loss,
+                'train/loss_x': group_loss_x,
+                'train/loss_s': group_loss_s,
+                'train/mask_ratio': total_mask_ratio.val,
+                'iters': iters
+            })
 
             if step % max(steps_per_epoch // 8, 1) == 0:
                 logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Mask ratio: '
@@ -280,6 +302,7 @@ def main():
                     logger.info('Smoke test: {:.2f} s/step (avg over {} steps), total steps {}, projected {:.1f} h'.format(
                         sec_per_step, timed_steps, total_steps, sec_per_step * total_steps / 3600))
                 logger.info('Peak GPU memory: {:.1f} GB'.format(torch.cuda.max_memory_allocated() / 1e9))
+                wandb.finish()
                 return
 
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
@@ -291,11 +314,11 @@ def main():
                         'EMA: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou, iou_class_ema[cls_idx]))
         logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n'.format(eval_mode, mIoU, mIoU_ema))
 
-        writer.add_scalar('eval/mIoU', mIoU, epoch)
-        writer.add_scalar('eval/mIoU_ema', mIoU_ema, epoch)
+        eval_log = {'eval/mIoU': mIoU, 'eval/mIoU_ema': mIoU_ema, 'epoch': epoch}
         for i, iou in enumerate(iou_class):
-            writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
-            writer.add_scalar('eval/%s_IoU_ema' % (CLASSES[cfg['dataset']][i]), iou_class_ema[i], epoch)
+            eval_log['eval/%s_IoU' % (CLASSES[cfg['dataset']][i])] = iou
+            eval_log['eval/%s_IoU_ema' % (CLASSES[cfg['dataset']][i])] = iou_class_ema[i]
+        wandb.log(eval_log)
 
         is_best = mIoU >= previous_best
         is_best_ema = mIoU_ema >= previous_best_ema
@@ -322,6 +345,8 @@ def main():
             torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
         if is_best_ema:
             torch.save(checkpoint, os.path.join(args.save_path, 'best_ema.pth'))
+
+    wandb.finish()
 
 
 if __name__ == '__main__':
