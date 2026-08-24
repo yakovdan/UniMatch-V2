@@ -83,12 +83,26 @@ def main():
 
     save_path = os.path.normpath(args.save_path)
     run_name = os.path.relpath(save_path, 'exp') if save_path.split(os.sep)[0] == 'exp' else save_path
+    # keep one W&B run across container restarts: the id is persisted next to latest.pth,
+    # so a relaunch resumes the run (like the checkpoint) instead of splitting its history
+    # into a CRASHED run plus a fresh one. An explicit WANDB_RUN_ID env var wins if set.
+    run_id_file = os.path.join(args.save_path, 'wandb_run_id.txt')
+    run_id = os.environ.get('WANDB_RUN_ID')
+    if run_id is None and os.path.exists(run_id_file):
+        run_id = open(run_id_file).read().strip()
+    if not run_id:
+        # any unique string is a valid wandb id (wandb.util.generate_id is gone in 0.28)
+        run_id = os.urandom(4).hex()
+    with open(run_id_file, 'w') as f:
+        f.write(run_id)
     wandb.init(
         project=os.environ.get('WANDB_PROJECT', 'unimatch-v2'),
         name=run_name,
         config=all_args,
         dir=args.save_path,
-        mode=wandb_mode
+        mode=wandb_mode,
+        id=run_id,
+        resume='allow'
     )
     # train/* and eval/* are logged on different clocks (optimizer steps vs epochs)
     wandb.define_metric('iters')
@@ -181,6 +195,11 @@ def main():
 
         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
+    # accumulates the supervised (loss_x) part of the current optimizer step's
+    # gradient; the unsupervised part is recovered at step end as .grad minus this
+    params = [p for p in model.parameters() if p.requires_grad]
+    grad_x_acc = [torch.zeros_like(p) for p in params]
+
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
                     'EMA: {:.2f} @epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
@@ -198,6 +217,8 @@ def main():
 
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
+            for g_x in grad_x_acc:
+                g_x.zero_()
 
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
@@ -217,11 +238,21 @@ def main():
                 img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
 
                 # labeled and unlabeled losses live in separate graphs, so
-                # backward each part right after its forward to halve peak memory
+                # backward each part right after its forward to halve peak memory.
+                # The labeled part uses autograd.grad + manual accumulation into
+                # .grad (numerically identical to .backward()) so grad_x_acc can
+                # track the supervised gradient separately from the unsupervised
+                # one that later backwards into the same .grad buffers.
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     pred_x = model(img_x)
                     loss_x = criterion_l(pred_x, mask_x)
-                (loss_x / (2.0 * accum)).backward()
+                grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
+                for p, g_x, g in zip(params, grad_x_acc, grads):
+                    if g is None:
+                        continue
+                    g_x += g
+                    p.grad = g if p.grad is None else p.grad.add_(g)
+                del grads
 
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2)), comp_drop=True).chunk(2)
@@ -261,6 +292,23 @@ def main():
                 mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum()
                 total_mask_ratio.update(mask_ratio.item())
 
+            # norms/cosine of the supervised vs unsupervised parts of this step's
+            # gradient, as applied (i.e. including the 1/(2*accum) loss scaling)
+            stats = torch.zeros(3, dtype=torch.float64, device='cuda')
+            for p, g_x in zip(params, grad_x_acc):
+                if p.grad is None:
+                    continue
+                g_s = p.grad - g_x
+                stats += torch.stack((
+                    (g_x * g_x).sum(dtype=torch.float64),
+                    (g_s * g_s).sum(dtype=torch.float64),
+                    (g_x * g_s).sum(dtype=torch.float64)
+                ))
+            norm_x_sq, norm_s_sq, dot_xs = stats.tolist()
+            grad_norm_x, grad_norm_s = norm_x_sq ** 0.5, norm_s_sq ** 0.5
+            grad_ratio_s_x = grad_norm_s / max(grad_norm_x, 1e-12)
+            grad_cos_x_s = dot_xs / max(grad_norm_x * grad_norm_s, 1e-12)
+
             optimizer.step()
 
             iters = epoch * steps_per_epoch + step
@@ -280,6 +328,10 @@ def main():
                 'train/loss_x': group_loss_x,
                 'train/loss_s': group_loss_s,
                 'train/mask_ratio': total_mask_ratio.val,
+                'train/grad_norm_x': grad_norm_x,
+                'train/grad_norm_s': grad_norm_s,
+                'train/grad_norm_s_over_x': grad_ratio_s_x,
+                'train/grad_cos_x_s': grad_cos_x_s,
                 'iters': iters
             })
 
