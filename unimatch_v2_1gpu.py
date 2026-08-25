@@ -49,6 +49,7 @@ parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
+GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
 
 
 def main():
@@ -104,10 +105,11 @@ def main():
         id=run_id,
         resume='allow'
     )
-    # train/* and eval/* are logged on different clocks (optimizer steps vs epochs)
+    # train/* and grad/* are logged per optimizer step, eval/* per epoch
     wandb.define_metric('iters')
     wandb.define_metric('epoch')
     wandb.define_metric('train/*', step_metric='iters')
+    wandb.define_metric('grad/*', step_metric='iters')
     wandb.define_metric('eval/*', step_metric='epoch')
 
     cudnn.enabled = True
@@ -181,6 +183,10 @@ def main():
     previous_best, previous_best_ema = 0.0, 0.0
     best_epoch, best_epoch_ema = 0, 0
     epoch = -1
+    # running count of optimizer steps whose cos(g_x, g_s) < GRAD_COS_CONFLICT_THRESH (supervised and
+    # unsupervised gradients pulling against each other), over all steps seen so far
+    # (persisted in the checkpoint across resumes)
+    grad_cos_conflict_steps, grad_cos_total_steps = 0, 0
 
     if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
         checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), map_location='cpu')
@@ -192,6 +198,9 @@ def main():
         previous_best_ema = checkpoint['previous_best_ema']
         best_epoch = checkpoint['best_epoch']
         best_epoch_ema = checkpoint['best_epoch_ema']
+        # .get: checkpoints written before these counters existed start counting from here
+        grad_cos_conflict_steps = checkpoint.get('grad_cos_conflict_steps', 0)
+        grad_cos_total_steps = checkpoint.get('grad_cos_total_steps', 0)
 
         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
@@ -308,6 +317,9 @@ def main():
             grad_norm_x, grad_norm_s = norm_x_sq ** 0.5, norm_s_sq ** 0.5
             grad_ratio_s_x = grad_norm_s / max(grad_norm_x, 1e-12)
             grad_cos_x_s = dot_xs / max(grad_norm_x * grad_norm_s, 1e-12)
+            grad_cos_total_steps += 1
+            grad_cos_conflict_steps += int(grad_cos_x_s < GRAD_COS_CONFLICT_THRESH)
+            grad_cos_conflict_pct = 100.0 * grad_cos_conflict_steps / grad_cos_total_steps
 
             optimizer.step()
 
@@ -328,10 +340,11 @@ def main():
                 'train/loss_x': group_loss_x,
                 'train/loss_s': group_loss_s,
                 'train/mask_ratio': total_mask_ratio.val,
-                'train/grad_norm_x': grad_norm_x,
-                'train/grad_norm_s': grad_norm_s,
-                'train/grad_norm_s_over_x': grad_ratio_s_x,
-                'train/grad_cos_x_s': grad_cos_x_s,
+                'grad/grad_norm_x': grad_norm_x,
+                'grad/grad_norm_s': grad_norm_s,
+                'grad/grad_norm_s_over_x': grad_ratio_s_x,
+                'grad/grad_cos_x_s': grad_cos_x_s,
+                'grad/grad_cos_x_s_lt_%g_pct' % GRAD_COS_CONFLICT_THRESH: grad_cos_conflict_pct,
                 'iters': iters
             })
 
@@ -390,7 +403,9 @@ def main():
             'previous_best': previous_best,
             'previous_best_ema': previous_best_ema,
             'best_epoch': best_epoch,
-            'best_epoch_ema': best_epoch_ema
+            'best_epoch_ema': best_epoch_ema,
+            'grad_cos_conflict_steps': grad_cos_conflict_steps,
+            'grad_cos_total_steps': grad_cos_total_steps
         }
         torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
         if is_best:
