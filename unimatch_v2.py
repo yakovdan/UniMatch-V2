@@ -161,7 +161,7 @@ def main():
         model.train()
 
         for i, ((img_x, mask_x),
-                (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2)) in enumerate(loader):
+                (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt)) in enumerate(loader):
             
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
             img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()

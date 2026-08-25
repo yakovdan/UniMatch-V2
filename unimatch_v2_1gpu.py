@@ -232,11 +232,12 @@ def main():
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
             for _ in range(accum):
-                (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2) = next(loader)
+                (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
 
                 img_x, mask_x = img_x.cuda(), mask_x.cuda()
                 img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()
                 ignore_mask, cutmix_box1, cutmix_box2 = ignore_mask.cuda(), cutmix_box1.cuda(), cutmix_box2.cuda()
+                mask_u_gt = mask_u_gt.cuda()  # GT of the unlabeled batch; not used by the loss yet
 
                 with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     pred_u_w = model_ema(img_u_w).detach()

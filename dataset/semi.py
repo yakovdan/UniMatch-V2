@@ -34,6 +34,13 @@ class SemiDataset(Dataset):
         img = Image.open(os.path.join(self.root, id.split(' ')[0])).convert('RGB')
         if self.mode == 'train_u':
             mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
+            # GT label of the unlabeled image; carried through the same geometric augmentation
+            # as `mask` and returned as `mask_u_gt` (255 = ignore / padding). Not used for training.
+            label_path = id.split(' ')[1]
+            if label_path == 'None':  # pools without GT (cityscapes train_extra, coco unlabeled2017)
+                label = Image.fromarray(np.full((img.size[1], img.size[0]), 255, dtype=np.uint8))
+            else:
+                label = Image.fromarray(np.array(Image.open(os.path.join(self.root, label_path))))
         else:
             mask = Image.fromarray(np.array(Image.open(os.path.join(self.root, id.split(' ')[1])))) 
         
@@ -41,10 +48,16 @@ class SemiDataset(Dataset):
             img, mask = normalize(img, mask)
             return img, mask, id
 
-        img, mask = resize(img, mask, (0.5, 2.0))
         ignore_value = 254 if self.mode == 'train_u' else 255
-        img, mask = crop(img, mask, self.size, ignore_value)
-        img, mask = hflip(img, mask, p=0.5)
+        if self.mode == 'train_u':
+            # tuple form: mask (dummy, padded 254) and label (padded 255) receive the SAME random draws
+            img, (mask, label) = resize(img, (mask, label), (0.5, 2.0))
+            img, (mask, label) = crop(img, (mask, label), self.size, (ignore_value, 255))
+            img, (mask, label) = hflip(img, (mask, label), p=0.5)
+        else:
+            img, mask = resize(img, mask, (0.5, 2.0))
+            img, mask = crop(img, mask, self.size, ignore_value)
+            img, mask = hflip(img, mask, p=0.5)
 
         if self.mode == 'train_l':
             return normalize(img, mask)
@@ -71,7 +84,10 @@ class SemiDataset(Dataset):
         mask = torch.from_numpy(np.array(mask)).long()
         ignore_mask[mask == 254] = 255
 
-        return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2
+        # already padded with 255 by crop, so no remap is needed
+        mask_u_gt = torch.from_numpy(np.array(label)).long()
+
+        return normalize(img_w), img_s1, img_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt
 
     def __len__(self):
         return len(self.ids)

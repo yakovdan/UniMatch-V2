@@ -6,27 +6,42 @@ import torch
 from torchvision import transforms
 
 
+# `mask` in resize / crop / hflip may be a single PIL image (returns a single image) or a
+# tuple/list of images (returns a tuple); every mask receives the SAME random draw, which
+# is taken exactly once per call from `img.size`.
+def _as_tuple(mask):
+    """Normalize `mask` to a tuple of PIL images; `single` tells the caller to hand back a bare image."""
+    if isinstance(mask, (tuple, list)):
+        return tuple(mask), False
+    return (mask,), True
+
+
 def crop(img, mask, size, ignore_value=255):
+    masks, single = _as_tuple(mask)
+    fills = tuple(ignore_value) if isinstance(ignore_value, (tuple, list)) else (ignore_value,) * len(masks)
+    assert len(fills) == len(masks), 'crop: one ignore_value per mask expected'
+
     w, h = img.size
     padw = size - w if w < size else 0
     padh = size - h if h < size else 0
     img = ImageOps.expand(img, border=(0, 0, padw, padh), fill=0)
-    mask = ImageOps.expand(mask, border=(0, 0, padw, padh), fill=ignore_value)
+    masks = tuple(ImageOps.expand(m, border=(0, 0, padw, padh), fill=f) for m, f in zip(masks, fills))
 
     w, h = img.size
     x = random.randint(0, w - size)
     y = random.randint(0, h - size)
     img = img.crop((x, y, x + size, y + size))
-    mask = mask.crop((x, y, x + size, y + size))
+    masks = tuple(m.crop((x, y, x + size, y + size)) for m in masks)
 
-    return img, mask
+    return img, (masks[0] if single else masks)
 
 
 def hflip(img, mask, p=0.5):
+    masks, single = _as_tuple(mask)
     if random.random() < p:
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
-        mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
-    return img, mask
+        masks = tuple(m.transpose(Image.FLIP_LEFT_RIGHT) for m in masks)
+    return img, (masks[0] if single else masks)
 
 
 def normalize(img, mask=None):
@@ -41,6 +56,7 @@ def normalize(img, mask=None):
 
 
 def resize(img, mask, ratio_range):
+    masks, single = _as_tuple(mask)
     w, h = img.size
     long_side = random.randint(int(max(h, w) * ratio_range[0]), int(max(h, w) * ratio_range[1]))
 
@@ -52,8 +68,8 @@ def resize(img, mask, ratio_range):
         oh = int(1.0 * h * long_side / w + 0.5)
 
     img = img.resize((ow, oh), Image.BILINEAR)
-    mask = mask.resize((ow, oh), Image.NEAREST)
-    return img, mask
+    masks = tuple(m.resize((ow, oh), Image.NEAREST) for m in masks)
+    return img, (masks[0] if single else masks)
 
 
 def blur(img, p=0.5):
