@@ -8,7 +8,7 @@ import time
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
-from torch.optim import AdamW
+from util.optim import build_adamw
 from torch.utils.data import DataLoader
 import wandb
 import yaml
@@ -126,7 +126,7 @@ def main():
     if cfg['lock_backbone']:
         model.lock_backbone()
 
-    optimizer = AdamW(
+    optimizer = build_adamw(
         [
             {'params': [p for p in model.backbone.parameters() if p.requires_grad], 'lr': cfg['lr']},
             {'params': [param for name, param in model.named_parameters() if 'backbone' not in name], 'lr': cfg['lr'] * cfg['lr_multi']}
@@ -251,7 +251,7 @@ def main():
                     if g is None:
                         continue
                     g_x += g
-                    p.grad = g if p.grad is None else p.grad.add_(g)
+                    p.grad = g.contiguous() if p.grad is None else p.grad.add_(g)
                 del grads
 
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):

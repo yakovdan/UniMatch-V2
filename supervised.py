@@ -10,7 +10,7 @@ from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.optim import AdamW
+from util.optim import build_adamw
 from torch.utils.data import DataLoader
 import wandb
 import yaml
@@ -158,7 +158,7 @@ def main():
     if cfg['lock_backbone']:
         model.lock_backbone()
     
-    optimizer = AdamW(
+    optimizer = build_adamw(
         [
             {'params': [p for p in model.backbone.parameters() if p.requires_grad], 'lr': cfg['lr']},
             {'params': [param for name, param in model.named_parameters() if 'backbone' not in name], 'lr': cfg['lr'] * cfg['lr_multi']}
