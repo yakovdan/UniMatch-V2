@@ -47,14 +47,17 @@ parser.add_argument('--bf16', action='store_true', help='bf16 autocast for forwa
 parser.add_argument('--stop-after', type=int, default=None, help='debug: stop after N optimizer steps (smoke test)')
 parser.add_argument('--ggr', type=str, default='none', choices=['none', 'vlr', 'osr', 'csr'],
                     help='rectify the unsupervised gradient against the supervised one (Chen et al., '
-                         'Geometric Gradient Rectification): vector-level, orthogonal-subspace or conic-subspace')
+                         'Geometric Gradient Rectification): vector-level, orthogonal-subspace or '
+                         'conic-subspace [env: GGR_MODE]')
 parser.add_argument('--ggr-dim', type=int, default=10,
-                    help='subspace dimension d for --ggr osr/csr; ignored by vlr')
+                    help='subspace dimension d for --ggr osr/csr; ignored by vlr [env: GGR_DIM]')
 parser.add_argument('--ggr-scope', type=str, default='all', choices=['backbone', 'head', 'all'],
-                    help='surgery scope P; the paper applies GGR to the encoder backbone by default')
+                    help="surgery scope P, defaulting to the whole model. The paper rectifies the "
+                         "encoder backbone only; 'all' is the scope this script's existing "
+                         'grad/* conflict diagnostics are measured over [env: GGR_SCOPE]')
 parser.add_argument('--ggr-reorth-every', type=int, default=0,
                     help='re-orthonormalise U every N steps (0 = off; the Gram-Schmidt append already '
-                         're-projects, so drift is normally negligible)')
+                         're-projects, so drift is normally negligible) [env: GGR_REORTH_EVERY]')
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
