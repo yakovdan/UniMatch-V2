@@ -8,6 +8,7 @@ import time
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from util.optim import build_adamw
 from torch.utils.data import DataLoader
 import wandb
@@ -51,6 +52,44 @@ parser.add_argument('--port', default=None, type=int)
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
 CLASS_GRAD_EMA_BETA = 0.95  # decay of the per-class supervised gradient EMA (see SUP_CLASS_GRAD_EMA)
+PROTO_EMA_BETA = 0.95  # decay of the per-class feature-prototype EMA (see PROTO_STATS)
+
+
+def rank_auc(scores, positive):
+    """AUC of `scores` as a detector of `positive` (bool mask): P(score_pos > score_neg), ties counted 1/2.
+    Returns nan if either group is empty."""
+    n_pos, n_neg = int(positive.sum()), int((~positive).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float('nan')
+    scores = scores.double()
+    # average ranks (1-based) so ties contribute 1/2
+    order = scores.argsort()
+    _, inv, counts = torch.unique_consecutive(scores[order], return_inverse=True, return_counts=True)
+    counts = counts.double()
+    first = torch.cumsum(counts, 0) - counts + 1                 # 1-based rank of the first member of each tie group
+    ranks = torch.empty_like(scores)
+    ranks[order] = (first + (counts - 1) / 2.0)[inv]             # mean rank within the tie group
+    return ((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)).item()
+
+
+def proto_bank_means(proto_S, proto_R, proto_rho, proto_updates, min_rho=1e-4):
+    """Class prototypes from the per-class EMA statistics (all per labeled pixel of class c):
+    proto_S[c] = mean f, proto_R[c, k] = mean p_k f, proto_rho[c, k] = mean p_k.
+      mu[c]        = (S_c - R_cc) / (1 - rho_cc): the (1 - p_c)-weighted class mean, i.e. the direction of the
+                     'toward' row [a^(c)]_c of the class-c classifier-gradient anchor;
+      mu_sub[c, k] = R_ck / rho_ck (k != c): the p_k-weighted mean of class-c pixels confused with k, i.e. the
+                     direction of the residual row [a^(c)]_k. Rows are unit-normalised; unavailable entries are
+                     flagged in the returned masks (class never seen, or rho_ck < min_rho)."""
+    K = proto_S.shape[0]
+    seen = torch.tensor([u > 0 for u in proto_updates], device=proto_S.device)
+    diag_rho = proto_rho.diagonal()
+    diag_R = proto_R[torch.arange(K), torch.arange(K)]
+    mu = (proto_S - diag_R) / (1.0 - diag_rho).clamp_min(1e-6)[:, None]
+    mu = F.normalize(mu, dim=1)
+    mu_sub = proto_R / proto_rho.clamp_min(min_rho)[:, :, None]
+    mu_sub = F.normalize(mu_sub, dim=2)
+    sub_ok = seen[:, None] & (proto_rho >= min_rho) & ~torch.eye(K, dtype=torch.bool, device=proto_S.device)
+    return mu, seen, mu_sub, sub_ok
 
 
 def main():
@@ -106,12 +145,14 @@ def main():
         id=run_id,
         resume='allow'
     )
-    # train/*, grad/* and grad_ema/* are logged per optimizer step, eval/* per epoch
+    # train/*, grad/*, grad_ema/*, grad_cls/* and proto/* are logged per optimizer step, eval/* per epoch
     wandb.define_metric('iters')
     wandb.define_metric('epoch')
     wandb.define_metric('train/*', step_metric='iters')
     wandb.define_metric('grad/*', step_metric='iters')
     wandb.define_metric('grad_ema/*', step_metric='iters')
+    wandb.define_metric('grad_cls/*', step_metric='iters')
+    wandb.define_metric('proto/*', step_metric='iters')
     wandb.define_metric('eval/*', step_metric='epoch')
 
     cudnn.enabled = True
@@ -148,6 +189,25 @@ def main():
     model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
+
+    # The classifier: the final 1x1 conv of the DPT head (dpt.py output_conv[2]). Every pixel's logits are a
+    # linear function of its input feature f (d channels, head resolution, before the x14 upsample), so the
+    # per-pixel classifier gradient is (p - e_label) f^T and its row k is the gradient w.r.t. prototype w_k.
+    classifier = model.head.scratch.output_conv[2]
+    cls_params = [p for p in classifier.parameters() if p.requires_grad]  # [weight (K, d, 1, 1), bias (K)]
+    n_cls_params = sum(p.numel() for p in cls_params)
+    class_names = CLASSES[cfg['dataset']]
+
+    # PROTO_STATS: feature-level prototype diagnostics. A forward hook on the classifier captures its input
+    # (f) and output (the logits) for the most recent forward of `model`; registered after the deepcopy so
+    # the EMA teacher's forwards never overwrite it. Detached, so no graph is kept alive.
+    proto_stats = os.environ.get('PROTO_STATS', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    cls_capture = {}
+    if proto_stats:
+        def _capture_cls_io(module, inputs, output):
+            cls_capture['f'] = inputs[0].detach()
+            cls_capture['z'] = output.detach()
+        classifier.register_forward_hook(_capture_cls_io)
 
     if cfg['criterion']['name'] == 'CELoss':
         criterion_l = nn.CrossEntropyLoss(**cfg['criterion']['kwargs']).cuda()
@@ -225,17 +285,23 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     grad_x_acc = [torch.zeros_like(p) for p in params]
     # gradients of the unconfident-correct (uc) / -incorrect (ui) losses, accumulated like
-    # grad_x_acc but only measured (cosines vs the supervised / unsupervised gradients), never
-    # applied. They cost two extra backward passes per micro-batch; UNCONF_GRAD=0 skips them.
-    unconf_grad = os.environ.get('UNCONF_GRAD', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-    logger.info('Unconfident-loss gradient cosines: {}'.format('on (set UNCONF_GRAD=0 to skip)' if unconf_grad else 'off (UNCONF_GRAD=0)'))
-    grad_uc_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
-    grad_ui_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
+    # grad_x_acc but only measured, never applied. UNCONF_GRAD=full (default, also '1'): whole-model
+    # gradients, two extra full backward passes per micro-batch, whole-model cosines vs g_x / g_s.
+    # UNCONF_GRAD=cls: classifier-only gradients (two tiny backward passes), enough for the per-class
+    # anchor comparison below but no whole-model cosines. UNCONF_GRAD=0: off.
+    unconf_mode = os.environ.get('UNCONF_GRAD', 'full').strip().lower()
+    unconf_mode = 'off' if unconf_mode in ('0', 'false', 'no', 'off') else ('cls' if unconf_mode in ('cls', 'classifier') else 'full')
+    unconf_grad = unconf_mode != 'off'
+    unconf_params = cls_params if unconf_mode == 'cls' else params
+    logger.info('Unconfident-loss gradients: {}'.format({'full': 'whole model (UNCONF_GRAD=full)', 'cls': 'classifier only (UNCONF_GRAD=cls)', 'off': 'off (UNCONF_GRAD=0)'}[unconf_mode]))
+    grad_uc_acc = [torch.zeros_like(p) for p in unconf_params] if unconf_grad else None
+    grad_ui_acc = [torch.zeros_like(p) for p in unconf_params] if unconf_grad else None
+    # positions of the classifier's parameters inside the accumulators (identity match), so their rows
+    # can be sliced out in either mode
+    unconf_cls_idx = [next(i for i, p in enumerate(unconf_params) if p is q) for q in cls_params] if unconf_grad else None
+    cls_idx_in_params = [next(i for i, p in enumerate(params) if p is q) for q in cls_params]
 
     if class_grad_ema:
-        cls_params = [p for p in model.head.scratch.output_conv[2].parameters() if p.requires_grad]
-        n_cls_params = sum(p.numel() for p in cls_params)
-        class_names = CLASSES[cfg['dataset']]
         logger.info('Per-class supervised classifier-gradient EMA: {} classes x {} classifier params, beta={} '
                     '(set SUP_CLASS_GRAD_EMA=0 to skip)'.format(cfg['nclass'], n_cls_params, CLASS_GRAD_EMA_BETA))
         # one flat (n_cls_params,) row per class, in `cls_params` order (weight, bias); a row is
@@ -250,6 +316,32 @@ def main():
             logger.info('************ Loaded per-class gradient EMA from {}\n'.format(grad_ema_path))
     else:
         logger.info('Per-class supervised gradient EMA: off (SUP_CLASS_GRAD_EMA=0)')
+
+    if proto_stats:
+        K, d_feat = cfg['nclass'], classifier.in_channels
+        logger.info('Prototype diagnostics (PROTO_STATS): {} classes x {} feature channels at head resolution, '
+                    'beta={} (set PROTO_STATS=0 to skip)'.format(K, d_feat, PROTO_EMA_BETA))
+        # per-labeled-pixel-of-class-c means, EMA'd over the optimizer steps where c occurs (first
+        # observation initializes): S[c] = mean f, R[c, k] = mean p_k f, rho[c, k] = mean p_k.
+        # See proto_bank_means() for what is derived from them.
+        proto_S = torch.zeros(K, d_feat, device='cuda')
+        proto_R = torch.zeros(K, K, d_feat, device='cuda')
+        proto_rho = torch.zeros(K, K, device='cuda')
+        proto_updates = [0] * K
+        proto_path = os.path.join(args.save_path, 'proto_ema.pth')
+        if os.path.exists(os.path.join(args.save_path, 'latest.pth')) and os.path.exists(proto_path):
+            proto_ckpt = torch.load(proto_path, map_location='cpu')
+            proto_S.copy_(proto_ckpt['S']); proto_R.copy_(proto_ckpt['R']); proto_rho.copy_(proto_ckpt['rho'])
+            proto_updates = proto_ckpt['updates']
+            logger.info('************ Loaded prototype EMA from {}\n'.format(proto_path))
+    else:
+        logger.info('Prototype diagnostics: off (PROTO_STATS=0)')
+
+    log_debug_prefixes = tuple(p for p in os.environ.get('LOG_DEBUG_PREFIXES', '').split(',') if p)
+
+    def downsample_mask(m, size):
+        # nearest-neighbour resize of a (B, H, W) label / confidence map to the head resolution
+        return F.interpolate(m[:, None].float(), size=size, mode='nearest')[:, 0]
 
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -273,9 +365,6 @@ def main():
             optimizer.zero_grad()
             for g_x in grad_x_acc:
                 g_x.zero_()
-            # this step's per-class sums of d/dtheta_cls sum_{p in c} CE_p and pixel counts N_c,
-            # for the classes present in the step; divided at step end to get the mean-CE gradient
-            cls_grad_sum, cls_pix_count = {}, {}
             if unconf_grad:
                 for g_uc, g_ui in zip(grad_uc_acc, grad_ui_acc):
                     g_uc.zero_()
@@ -283,6 +372,10 @@ def main():
             # this step's per-class sums of d/dtheta_cls sum_{p in c} CE_p and pixel counts N_c,
             # for the classes present in the step; divided at step end to get the mean-CE gradient
             cls_grad_sum, cls_pix_count = {}, {}
+            # this step's per-class feature sums over labeled pixels (S, R, rho as in proto_bank_means,
+            # un-normalised) and the complement-pixel scores accumulated for the step-end statistics
+            proto_acc = {'S': {}, 'N': {}, 'R': {}, 'rho': {}}
+            comp_buf = {'proto': [], 'proto_sub': [], 'conf': [], 'incorrect': [], 'disagree': [], 'student_eq_gt': []}
             group_loss, group_loss_x, group_loss_s, group_loss_s_unconf = 0.0, 0.0, 0.0, 0.0
             group_loss_s_unconf_correct, group_loss_s_unconf_incorrect = 0.0, 0.0
 
@@ -313,6 +406,26 @@ def main():
                     loss_x = criterion_l(pred_x, mask_x)
                     if class_grad_ema:
                         ce_x_pix = criterion_l_pix(pred_x, mask_x)
+                # prototype statistics of this labeled micro-batch, from the classifier's captured input
+                # (features at head resolution) and output (logits), with the labels resized to match
+                if proto_stats:
+                    with torch.no_grad():
+                        f_l, z_l = cls_capture['f'].float(), cls_capture['z'].float()
+                        y_l = downsample_mask(mask_x, f_l.shape[-2:]).long().reshape(-1)
+                        F_l = f_l.permute(0, 2, 3, 1).reshape(-1, f_l.shape[1])
+                        P_l = z_l.softmax(dim=1).permute(0, 2, 3, 1).reshape(-1, z_l.shape[1])
+                        for c in torch.unique(y_l).tolist():
+                            if not 0 <= c < cfg['nclass']:
+                                continue
+                            sel = y_l == c
+                            Fc, Pc = F_l[sel], P_l[sel]
+                            if c not in proto_acc['N']:
+                                proto_acc['S'][c] = Fc.sum(0); proto_acc['N'][c] = int(sel.sum())
+                                proto_acc['R'][c] = Pc.T @ Fc; proto_acc['rho'][c] = Pc.sum(0)
+                            else:
+                                proto_acc['S'][c] += Fc.sum(0); proto_acc['N'][c] += int(sel.sum())
+                                proto_acc['R'][c] += Pc.T @ Fc; proto_acc['rho'][c] += Pc.sum(0)
+                        del f_l, z_l, y_l, F_l, P_l
                 # per-class classifier gradients first, with the graph retained; the existing
                 # supervised backward below then consumes it exactly as before
                 if class_grad_ema:
@@ -356,6 +469,47 @@ def main():
                 mask_u_gt_cutmixed1, mask_u_gt_cutmixed2 = mask_u_gt.clone(), mask_u_gt.clone()
                 mask_u_gt_cutmixed1[cutmix_box1 == 1] = mask_u_gt.flip(0)[cutmix_box1 == 1]
                 mask_u_gt_cutmixed2[cutmix_box2 == 1] = mask_u_gt.flip(0)[cutmix_box2 == 1]
+
+                # prototype diagnostics on the complement (conf < thresh, GT known) at head resolution, for
+                # both strong views (the hook holds the 2B-batch forward): per pixel, the cosine of its
+                # classifier-input feature to the EMA class prototypes gives the comparison-rule score
+                #   s_other - s_label  (> 0: the labeled data's features say another class fits better),
+                # its boundary-subpopulation variant, the confidence baseline, and the student/teacher
+                # disagreement. Scores are pooled over the step and summarised at step end.
+                if proto_stats and any(u > 0 for u in proto_updates):
+                    with torch.no_grad():
+                        f_u, z_u = cls_capture['f'].float(), cls_capture['z'].float()
+                        hw = f_u.shape[-2:]
+                        lab = torch.cat((downsample_mask(mask_u_w_cutmixed1, hw), downsample_mask(mask_u_w_cutmixed2, hw))).long()
+                        gt = torch.cat((downsample_mask(mask_u_gt_cutmixed1, hw), downsample_mask(mask_u_gt_cutmixed2, hw))).long()
+                        conf = torch.cat((downsample_mask(conf_u_w_cutmixed1, hw), downsample_mask(conf_u_w_cutmixed2, hw)))
+                        ign = torch.cat((downsample_mask(ignore_mask_cutmixed1, hw), downsample_mask(ignore_mask_cutmixed2, hw))).long()
+                        mu, seen, mu_sub, sub_ok = proto_bank_means(proto_S, proto_R, proto_rho, proto_updates)
+                        comp = (conf < cfg['conf_thresh']) & (ign != 255) & (gt != 255) & seen[lab.clamp(max=cfg['nclass'] - 1)] & (lab < cfg['nclass'])
+                        if comp.any():
+                            Fu = F.normalize(f_u.permute(0, 2, 3, 1)[comp], dim=1)   # (n, d) unit features
+                            lab_c, gt_c, conf_c = lab[comp], gt[comp], conf[comp]
+                            student = z_u.argmax(dim=1)[comp]
+                            sims = Fu @ mu.T                                         # (n, K) cosine to each prototype
+                            sims[:, ~seen] = float('-inf')
+                            s_label = sims.gather(1, lab_c[:, None])[:, 0]
+                            s_other = sims.scatter(1, lab_c[:, None], float('-inf')).max(dim=1).values
+                            # boundary-subpopulation variant: for a pixel labelled L, compare s_label with the
+                            # best cosine to mu_sub[c, L] (class-c labeled pixels confused with L), c != L
+                            s_other_sub = torch.full_like(s_label, float('-inf'))
+                            for L in torch.unique(lab_c).tolist():
+                                idx = lab_c == L
+                                ok_c = sub_ok[:, L]
+                                if ok_c.any():
+                                    s_other_sub[idx] = (Fu[idx] @ mu_sub[:, L, :].T)[:, ok_c].max(dim=1).values
+                            fin = torch.isfinite(s_other)
+                            comp_buf['proto'].append((s_other - s_label)[fin])
+                            comp_buf['proto_sub'].append((s_other_sub - s_label)[fin])
+                            comp_buf['conf'].append(-conf_c[fin])
+                            comp_buf['incorrect'].append((lab_c != gt_c)[fin])
+                            comp_buf['disagree'].append((student != lab_c)[fin])
+                            comp_buf['student_eq_gt'].append((student == gt_c)[fin])
+                        del f_u, z_u, lab, gt, conf, ign, mu, mu_sub
 
                 # "unconfident" losses: the same per-pixel CE over the complementary pixel set
                 # (conf < thresh instead of >=), with the same normalizer, so
@@ -404,7 +558,7 @@ def main():
                 # masks) for all three backward passes. Scaled like g_x / g_s so norms compare.
                 if unconf_grad:
                     for loss_part, acc in ((loss_u_s_unconf_correct, grad_uc_acc), (loss_u_s_unconf_incorrect, grad_ui_acc)):
-                        grads = torch.autograd.grad(loss_part / (2.0 * accum), params, retain_graph=True, allow_unused=True)
+                        grads = torch.autograd.grad(loss_part / (2.0 * accum), unconf_params, retain_graph=True, allow_unused=True)
                         for g_acc, g in zip(acc, grads):
                             if g is not None:
                                 g_acc += g
@@ -433,12 +587,13 @@ def main():
             # unconfident-correct (uc) / -incorrect (ui) gradients of this step, as applied
             # (i.e. including the 1/(2*accum) loss scaling)
             stats = torch.zeros(10, dtype=torch.float64, device='cuda')
+            whole_model_unconf = unconf_grad and unconf_mode == 'full'
             for i, (p, g_x) in enumerate(zip(params, grad_x_acc)):
                 if p.grad is None:
                     continue
                 g_s = p.grad - g_x
                 terms = [g_x * g_x, g_s * g_s, g_x * g_s]
-                if unconf_grad:
+                if whole_model_unconf:
                     g_uc, g_ui = grad_uc_acc[i], grad_ui_acc[i]
                     terms += [g_uc * g_uc, g_ui * g_ui, g_uc * g_x, g_uc * g_s, g_ui * g_x, g_ui * g_s, g_uc * g_ui]
                 stats[:len(terms)] += torch.stack([t.sum(dtype=torch.float64) for t in terms])
@@ -447,7 +602,7 @@ def main():
             grad_norm_x, grad_norm_s = norm_x_sq ** 0.5, norm_s_sq ** 0.5
             grad_ratio_s_x = grad_norm_s / max(grad_norm_x, 1e-12)
             grad_cos_x_s = dot_xs / max(grad_norm_x * grad_norm_s, 1e-12)
-            if unconf_grad:
+            if whole_model_unconf:
                 grad_norm_uc, grad_norm_ui = norm_uc_sq ** 0.5, norm_ui_sq ** 0.5
                 grad_cos_x_uc = dot_uc_x / max(grad_norm_x * grad_norm_uc, 1e-12)
                 grad_cos_s_uc = dot_uc_s / max(grad_norm_s * grad_norm_uc, 1e-12)
@@ -485,7 +640,7 @@ def main():
                 'iters': iters
             }
 
-            if unconf_grad:
+            if whole_model_unconf:
                 log.update({
                     'grad/grad_norm_unconf_correct': grad_norm_uc,
                     'grad/grad_norm_unconf_incorrect': grad_norm_ui,
@@ -512,7 +667,98 @@ def main():
                     if grad_ema_cls_updates[c] > 0:
                         log['grad_ema/norm_%s' % name] = ema_norms[c]
                         log['grad_ema/updates_%s' % name] = grad_ema_cls_updates[c]
+
+                # Tier 1a: row-cosine matrices between a step gradient's classifier rows and the per-class
+                # anchor bank. With A[c, k] = row k of anchor a^(c) (the weight part of grad_ema_cls[c]) and
+                # G[k] = row k of the gradient's classifier weight, M[k, c] = cos(G[k], A[c, k]):
+                #   diagonal  M[k, k]: row k against its own class's 'toward' row;
+                #   off-diag  M[k, c]: row k against class c's residual row -- the second sign check.
+                # Logged per gradient: mean diagonal, mean over rows of min_{c != k} M[k, c], and the fraction
+                # of rows whose off-diagonal minimum is negative. Rows/classes without an initialised anchor
+                # or with a zero gradient row are excluded. g_x's own diagonal is a consistency check: it
+                # tends to +1 as the labeled set is fitted (residual confusion rho << C), but is negative early,
+                # when the near-uniform softmax gives every class ~0.95 confusion mass per pixel and the
+                # background pixels' 'push w_k away' terms dominate each mixed row.
+                K, d_cls = cfg['nclass'], cls_params[0].shape[1]
+                with torch.no_grad():
+                    A = grad_ema_cls[:, :K * d_cls].view(K, K, d_cls)
+                    A_norm = A.norm(dim=2)                                                   # (c, k)
+                    inited = torch.tensor([u > 0 for u in grad_ema_cls_updates], device='cuda')
+                    eye = torch.eye(K, dtype=torch.bool, device='cuda')
+                    row_sources = [('x', [grad_x_acc[i] for i in cls_idx_in_params]),
+                                   ('s', [params[i].grad - grad_x_acc[i] for i in cls_idx_in_params])]
+                    if unconf_grad:
+                        row_sources += [('unconf_correct', [grad_uc_acc[i] for i in unconf_cls_idx]),
+                                        ('unconf_incorrect', [grad_ui_acc[i] for i in unconf_cls_idx])]
+                    for src_name, tensors in row_sources:
+                        G = torch.cat([t.reshape(-1) for t in tensors])[:K * d_cls].view(K, d_cls)
+                        G_norm = G.norm(dim=1)
+                        M = torch.einsum('kd,ckd->kc', G, A) / (G_norm[:, None] * A_norm.T).clamp_min(1e-12)
+                        row_ok = inited & (G_norm > 0)
+                        valid = row_ok[:, None] & inited[None, :]
+                        diag = M.diagonal()[row_ok]
+                        off_min = M.masked_fill(~valid | eye, float('inf')).min(dim=1).values
+                        off_min = off_min[torch.isfinite(off_min)]
+                        if diag.numel() > 0:
+                            log['grad_cls/rowcos_diag_mean_%s' % src_name] = diag.mean().item()
+                        if off_min.numel() > 0:
+                            log['grad_cls/rowcos_offmin_mean_%s' % src_name] = off_min.mean().item()
+                            log['grad_cls/rowcos_offmin_neg_frac_%s' % src_name] = (off_min < 0).float().mean().item()
+
+            if proto_stats:
+                # EMA update of the prototype bank for the classes present in this step's labeled batches
+                for c, N_c in proto_acc['N'].items():
+                    S_c, R_c, rho_c = proto_acc['S'][c] / N_c, proto_acc['R'][c] / N_c, proto_acc['rho'][c] / N_c
+                    if proto_updates[c] == 0:
+                        proto_S[c].copy_(S_c); proto_R[c].copy_(R_c); proto_rho[c].copy_(rho_c)
+                    else:
+                        proto_S[c].mul_(PROTO_EMA_BETA).add_(S_c, alpha=1 - PROTO_EMA_BETA)
+                        proto_R[c].mul_(PROTO_EMA_BETA).add_(R_c, alpha=1 - PROTO_EMA_BETA)
+                        proto_rho[c].mul_(PROTO_EMA_BETA).add_(rho_c, alpha=1 - PROTO_EMA_BETA)
+                    proto_updates[c] += 1
+                # per-class residual confusion mass on labeled data (per pixel of class c, summed over k != c):
+                # the classes with any signal for the second sign check
+                offdiag_conf = (proto_rho - torch.diag(proto_rho.diagonal())).sum(dim=1).tolist()
+                for c, name in enumerate(class_names):
+                    if proto_updates[c] > 0:
+                        log['proto/confusion_%s' % name] = offdiag_conf[c]
+                # complement statistics pooled over the step
+                if comp_buf['incorrect']:
+                    inc = torch.cat(comp_buf['incorrect'])
+                    sc_proto, sc_sub, sc_conf = torch.cat(comp_buf['proto']), torch.cat(comp_buf['proto_sub']), torch.cat(comp_buf['conf'])
+                    disagree, stud_gt = torch.cat(comp_buf['disagree']), torch.cat(comp_buf['student_eq_gt'])
+                    n_inc, n_cor = int(inc.sum()), int((~inc).sum())
+                    log['proto/n_unconf_incorrect'] = n_inc
+                    log['proto/n_unconf_correct'] = n_cor
+                    if n_cor > 0:
+                        log['proto/suspect_rate_correct'] = (sc_proto[~inc] > 0).float().mean().item()
+                        log['proto/disagree_rate_correct'] = disagree[~inc].float().mean().item()
+                    if n_inc > 0:
+                        log['proto/suspect_rate_incorrect'] = (sc_proto[inc] > 0).float().mean().item()
+                        log['proto/disagree_rate_incorrect'] = disagree[inc].float().mean().item()
+                        log['proto/incorrect_student_eq_gt_rate'] = stud_gt[inc].float().mean().item()
+                    if n_inc > 0 and n_cor > 0:
+                        # AUC of each score as a detector of incorrect pseudo-labels on the complement
+                        log['proto/auc_proto'] = rank_auc(sc_proto, inc)
+                        sub_fin = torch.isfinite(sc_sub)
+                        if sub_fin.any() and inc[sub_fin].any() and (~inc[sub_fin]).any():
+                            log['proto/auc_proto_sub'] = rank_auc(sc_sub[sub_fin], inc[sub_fin])
+                        log['proto/auc_conf'] = rank_auc(sc_conf, inc)
+                        # are the prototype score and confidence complementary? pixel-level correlation of the
+                        # two scores, the AUC of their z-scored sum, and the same with student/teacher
+                        # disagreement added (a binary score; its own AUC is (TPR + TNR) / 2)
+                        z = lambda s: (s - s.mean()) / s.std().clamp_min(1e-12)
+                        zp, zc, zd = z(sc_proto.float()), z(sc_conf.float()), z(disagree.float())
+                        log['proto/corr_proto_conf'] = (zp * zc).mean().item()
+                        log['proto/auc_combo_pc'] = rank_auc(zp + zc, inc)
+                        log['proto/auc_combo_pcd'] = rank_auc(zp + zc + zd, inc)
+                        log['proto/auc_disagree'] = rank_auc(disagree.float(), inc)
             wandb.log(log)
+            # LOG_DEBUG_PREFIXES="grad_cls/,proto/": also print the matching keys of each step's log dict
+            # (for --stop-after smoke tests with wandb disabled)
+            if log_debug_prefixes:
+                logger.info('log[%s] = %s' % (','.join(log_debug_prefixes),
+                            {k: (round(v, 4) if isinstance(v, float) else v) for k, v in sorted(log.items()) if k.startswith(log_debug_prefixes)}))
             if step % max(steps_per_epoch // 8, 1) == 0:
                 logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss s unconf: {:.3f} '
                             '(correct: {:.3f}, incorrect: {:.3f}), Mask ratio: {:.3f}'.format(
@@ -578,6 +824,9 @@ def main():
         if class_grad_ema:
             torch.save({'grad_ema_cls': grad_ema_cls.cpu(), 'updates': grad_ema_cls_updates, 'beta': CLASS_GRAD_EMA_BETA},
                        grad_ema_path)
+        if proto_stats:
+            torch.save({'S': proto_S.cpu(), 'R': proto_R.cpu(), 'rho': proto_rho.cpu(), 'updates': proto_updates,
+                        'beta': PROTO_EMA_BETA, 'class_names': list(class_names)}, proto_path)
         if is_best:
             torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
         if is_best_ema:
