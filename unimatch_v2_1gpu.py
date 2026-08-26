@@ -3,8 +3,10 @@ from copy import deepcopy
 import logging
 import os
 import pprint
+import random
 import time
 
+import numpy as np
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
@@ -58,6 +60,13 @@ parser.add_argument('--ggr-scope', type=str, default='all', choices=['backbone',
 parser.add_argument('--ggr-reorth-every', type=int, default=0,
                     help='re-orthonormalise U every N steps (0 = off; the Gram-Schmidt append already '
                          're-projects, so drift is normally negligible) [env: GGR_REORTH_EVERY]')
+parser.add_argument('--seed', type=int, default=0,
+                    help='seed for model init, data order and augmentations. Each epoch is reseeded '
+                         'from (seed, epoch), so a resume reproduces the original run [env: SEED]')
+parser.add_argument('--deterministic', action='store_true',
+                    help='trade throughput for reproducibility: disable cudnn.benchmark and request '
+                         'deterministic kernels. Some ops (bilinear interpolate backward) have no '
+                         'deterministic CUDA implementation and only warn [env: DETERMINISTIC]')
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
@@ -66,20 +75,69 @@ GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflic
 GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
 GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
 
+def boolean(raw):
+    lowered = raw.strip().lower()
+    if lowered in ('1', 'true', 'yes', 'on'):
+        return True
+    if lowered in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError
+
+
 # When set, these win over the command line, matching how USE_WANDB overrides
 # wandb_mode. Launch paths that cannot easily thread arguments through to the
 # process (Vast's --onstart, which replaces the image entrypoint) can set these
 # instead. (env var, args attribute, type, allowed values or None)
-GGR_ENV_OVERRIDES = (
+ENV_OVERRIDES = (
     ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr')),
     ('GGR_DIM', 'ggr_dim', int, None),
     ('GGR_SCOPE', 'ggr_scope', str, ('backbone', 'head', 'all')),
     ('GGR_REORTH_EVERY', 'ggr_reorth_every', int, None),
+    ('SEED', 'seed', int, None),
+    ('DETERMINISTIC', 'deterministic', boolean, None),
 )
 
 
-def apply_ggr_env_overrides(args, logger):
-    for env, attr, cast, choices in GGR_ENV_OVERRIDES:
+def seed_everything(seed):
+    """Seed every RNG the training path draws from.
+
+    The data pipeline uses three separate generators: Python's `random` and
+    `numpy.random` (dataset/transform.py: crops, flips, blur, CutMix boxes),
+    and torch's CPU RNG (torchvision ColorJitter, and the Binomial sample plus
+    randperm behind Complementary Dropout in model/semseg/dpt.py). Model head
+    init is torch CPU RNG as well; the backbone is loaded from a checkpoint.
+
+    DataLoader workers do not need a worker_init_fn: torch's _worker_loop
+    already derives per-worker seeds for `random`, `numpy` and torch from the
+    loader's own generator, so seeding those generators is sufficient. Verified
+    on torch 2.10; numpy seeding there dates to torch 1.9.
+    """
+    random.seed(seed)
+    np.random.seed(seed % 2 ** 32)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def setup_determinism(args, logger):
+    # cuBLAS reads this when it first initialises, so it has to be set before any
+    # CUDA work; without it torch.use_deterministic_algorithms raises on matmuls.
+    if args.deterministic and 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    seed_everything(args.seed)
+    cudnn.enabled = True
+    # benchmark picks kernels by timing, so it is a nondeterminism source of its own
+    cudnn.benchmark = not args.deterministic
+    cudnn.deterministic = args.deterministic
+    if args.deterministic:
+        # warn_only: bilinear interpolate backward (used on every forward here) has
+        # no deterministic CUDA kernel, so strict mode would abort the run
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    logger.info('seed=%d deterministic=%s cudnn.benchmark=%s\n' % (
+        args.seed, args.deterministic, cudnn.benchmark))
+
+
+def apply_env_overrides(args, logger):
+    for env, attr, cast, choices in ENV_OVERRIDES:
         raw = os.environ.get(env)
         if raw is None:
             continue
@@ -110,7 +168,10 @@ def main():
     logger.propagate = 0
 
     # before all_args, so the effective values are what gets logged and sent to W&B
-    apply_ggr_env_overrides(args, logger)
+    apply_env_overrides(args, logger)
+    # before setup_distributed: the first CUDA call happens in there, and
+    # CUBLAS_WORKSPACE_CONFIG has to be in place before cuBLAS initialises
+    setup_determinism(args, logger)
 
     rank, world_size = setup_distributed(port=args.port)
     assert world_size == 1, 'this script is single-GPU only; use unimatch_v2.py for multi-GPU'
@@ -157,9 +218,6 @@ def main():
     wandb.define_metric('train/*', step_metric='iters')
     wandb.define_metric('grad/*', step_metric='iters')
     wandb.define_metric('eval/*', step_metric='epoch')
-
-    cudnn.enabled = True
-    cudnn.benchmark = True
 
     model_configs = {
         'small': {'encoder_size': 'small', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -212,14 +270,24 @@ def main():
         cfg['dataset'], cfg['data_root'], 'val'
     )
 
+    # one generator per loader: it drives both the shuffle order and, through
+    # torch's worker-seeding, the augmentation RNGs inside the workers. Distinct
+    # seeds so the labeled and unlabeled streams do not share a permutation.
+    gen_l, gen_u, gen_val = (torch.Generator() for _ in range(3))
+    gen_l.manual_seed(args.seed + 1)
+    gen_u.manual_seed(args.seed + 2)
+    gen_val.manual_seed(args.seed + 3)
+
     trainloader_l = DataLoader(
-        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, shuffle=True
+        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, shuffle=True,
+        generator=gen_l
     )
     trainloader_u = DataLoader(
-        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, shuffle=True
+        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, shuffle=True,
+        generator=gen_u
     )
     valloader = DataLoader(
-        valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False
+        valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, generator=gen_val
     )
 
     # partially filled accumulation groups at epoch end are dropped, so leftover
@@ -235,7 +303,13 @@ def main():
     grad_cos_conflict_steps, grad_cos_total_steps = 0, 0
 
     if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
-        checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), map_location='cpu')
+        # weights_only=False: this file is written by the block at the end of this loop, so
+        # it is as trusted as the script itself. The default flipped to True in torch 2.6,
+        # and checkpoints written before the float() cast below carry a numpy scalar in
+        # previous_best, which the restricted unpickler refuses ("Unsupported global:
+        # numpy._core.multiarray.scalar") -- i.e. every resume died at this line.
+        checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), map_location='cpu',
+                                weights_only=False)
         model.load_state_dict(checkpoint['model'])
         model_ema.load_state_dict(checkpoint['model_ema'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -247,6 +321,12 @@ def main():
         # .get: checkpoints written before these counters existed start counting from here
         grad_cos_conflict_steps = checkpoint.get('grad_cos_conflict_steps', 0)
         grad_cos_total_steps = checkpoint.get('grad_cos_total_steps', 0)
+
+        # per-epoch reseeding makes a resume reproducible only under the same seed
+        ckpt_seed = checkpoint.get('seed')
+        if ckpt_seed is not None and ckpt_seed != args.seed:
+            logger.warning('resuming a run written with seed %s under seed %s: epochs up to %d used '
+                           'the old seed' % (ckpt_seed, args.seed, epoch))
 
         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
@@ -316,6 +396,16 @@ def main():
         total_loss_x = AverageMeter()
         total_loss_s = AverageMeter()
         total_mask_ratio = AverageMeter()
+
+        # Reseed from (seed, epoch) rather than letting the streams run on. This
+        # makes each epoch's data order and augmentations a pure function of the
+        # two, so resuming at epoch N reproduces the uninterrupted run without
+        # having to serialise RNG state into the checkpoint. Must happen before
+        # the iterator below, which is when the samplers draw their permutations.
+        epoch_seed = (args.seed + 100003 * (epoch + 1)) % 2 ** 31
+        seed_everything(epoch_seed)
+        gen_l.manual_seed(epoch_seed + 1)
+        gen_u.manual_seed(epoch_seed + 2)
 
         loader = iter(zip(trainloader_l, trainloader_u))
 
@@ -570,6 +660,11 @@ def main():
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
         mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=14)
+        # evaluate returns np.mean(...), a numpy scalar, which propagates into
+        # previous_best and from there into the checkpoint. torch.load's weights_only=True
+        # path (the default since torch 2.6) cannot unpickle a numpy scalar, so an
+        # uncast value here is what breaks the auto-resume above.
+        mIoU, mIoU_ema = float(mIoU), float(mIoU_ema)
 
         for (cls_idx, iou) in enumerate(iou_class):
             logger.info('***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, '
@@ -602,7 +697,8 @@ def main():
             'best_epoch': best_epoch,
             'best_epoch_ema': best_epoch_ema,
             'grad_cos_conflict_steps': grad_cos_conflict_steps,
-            'grad_cos_total_steps': grad_cos_total_steps
+            'grad_cos_total_steps': grad_cos_total_steps,
+            'seed': args.seed
         }
         torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
         if is_best:
