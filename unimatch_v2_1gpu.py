@@ -66,6 +66,34 @@ GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflic
 GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
 GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
 
+# When set, these win over the command line, matching how USE_WANDB overrides
+# wandb_mode. Launch paths that cannot easily thread arguments through to the
+# process (Vast's --onstart, which replaces the image entrypoint) can set these
+# instead. (env var, args attribute, type, allowed values or None)
+GGR_ENV_OVERRIDES = (
+    ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr')),
+    ('GGR_DIM', 'ggr_dim', int, None),
+    ('GGR_SCOPE', 'ggr_scope', str, ('backbone', 'head', 'all')),
+    ('GGR_REORTH_EVERY', 'ggr_reorth_every', int, None),
+)
+
+
+def apply_ggr_env_overrides(args, logger):
+    for env, attr, cast, choices in GGR_ENV_OVERRIDES:
+        raw = os.environ.get(env)
+        if raw is None:
+            continue
+        try:
+            value = cast(raw)
+        except ValueError:
+            raise ValueError("invalid %s='%s': expected %s" % (env, raw, cast.__name__))
+        if choices is not None and value not in choices:
+            raise ValueError("invalid %s='%s': expected one of %s" % (env, raw, ', '.join(choices)))
+        previous = getattr(args, attr)
+        setattr(args, attr, value)
+        if value != previous:
+            logger.info('%s=%s overrides --%s %s' % (env, value, attr.replace('_', '-'), previous))
+
 
 def main():
     args = parser.parse_args()
@@ -80,6 +108,9 @@ def main():
 
     logger = init_log('global', logging.INFO)
     logger.propagate = 0
+
+    # before all_args, so the effective values are what gets logged and sent to W&B
+    apply_ggr_env_overrides(args, logger)
 
     rank, world_size = setup_distributed(port=args.port)
     assert world_size == 1, 'this script is single-GPU only; use unimatch_v2.py for multi-GPU'
@@ -460,11 +491,17 @@ def main():
                         continue
                     torch.add(g_x, g_s, out=p.grad)
 
-                # applied-conflict diagnostics: >= 0 for vlr (Prop. 2), ~0 for osr
-                # once the anchor is in span(U) (Prop. 4)
+                # raw vs applied conflict (paper section C.1). Both are restricted to the
+                # surgery scope so they are directly comparable; grad/grad_cos_x_s stays
+                # whole-model and keeps its meaning across the pre-GGR run history.
+                # Expect >= 0 after vlr (Prop. 2) and ~0 after osr once the anchor is in
+                # span(U) (Prop. 4); csr only approximates non-opposition, so its
+                # cos_after can stay negative -- that gap is the paper's own caveat.
                 dot_after = torch.dot(g_x_scope, g_u_scope).item()
                 norm_s_after = g_u_scope.norm().item()
                 ggr_stats.update({
+                    'grad/ggr_cos_before': scope_dot_xs / max(
+                        (scope_norm_x_sq * scope_norm_s_sq) ** 0.5, 1e-12),
                     'grad/ggr_cos_after': dot_after / max(scope_norm_x_sq ** 0.5 * norm_s_after, 1e-12),
                     'grad/ggr_delta_norm': delta_norm,
                     'grad/ggr_delta_rel': delta_norm / max(scope_norm_s_sq ** 0.5, 1e-12),
