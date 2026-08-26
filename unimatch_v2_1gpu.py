@@ -208,6 +208,13 @@ def main():
     # gradient; the unsupervised part is recovered at step end as .grad minus this
     params = [p for p in model.parameters() if p.requires_grad]
     grad_x_acc = [torch.zeros_like(p) for p in params]
+    # gradients of the unconfident-correct (uc) / -incorrect (ui) losses, accumulated like
+    # grad_x_acc but only measured (cosines vs the supervised / unsupervised gradients), never
+    # applied. They cost two extra backward passes per micro-batch; UNCONF_GRAD=0 skips them.
+    unconf_grad = os.environ.get('UNCONF_GRAD', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    logger.info('Unconfident-loss gradient cosines: {}'.format('on (set UNCONF_GRAD=0 to skip)' if unconf_grad else 'off (UNCONF_GRAD=0)'))
+    grad_uc_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
+    grad_ui_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
 
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -216,6 +223,9 @@ def main():
         total_loss = AverageMeter()
         total_loss_x = AverageMeter()
         total_loss_s = AverageMeter()
+        total_loss_s_unconf = AverageMeter()
+        total_loss_s_unconf_correct = AverageMeter()
+        total_loss_s_unconf_incorrect = AverageMeter()
         total_mask_ratio = AverageMeter()
 
         loader = iter(zip(trainloader_l, trainloader_u))
@@ -228,8 +238,13 @@ def main():
             optimizer.zero_grad()
             for g_x in grad_x_acc:
                 g_x.zero_()
+            if unconf_grad:
+                for g_uc, g_ui in zip(grad_uc_acc, grad_ui_acc):
+                    g_uc.zero_()
+                    g_ui.zero_()
 
-            group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
+            group_loss, group_loss_x, group_loss_s, group_loss_s_unconf = 0.0, 0.0, 0.0, 0.0
+            group_loss_s_unconf_correct, group_loss_s_unconf_incorrect = 0.0, 0.0
 
             for _ in range(accum):
                 (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
@@ -278,16 +293,63 @@ def main():
                 conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w.flip(0)[cutmix_box2 == 1]
                 ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask.flip(0)[cutmix_box2 == 1]
 
+                # GT of the unlabeled images in the same CutMix frame as the strong views
+                mask_u_gt_cutmixed1, mask_u_gt_cutmixed2 = mask_u_gt.clone(), mask_u_gt.clone()
+                mask_u_gt_cutmixed1[cutmix_box1 == 1] = mask_u_gt.flip(0)[cutmix_box1 == 1]
+                mask_u_gt_cutmixed2[cutmix_box2 == 1] = mask_u_gt.flip(0)[cutmix_box2 == 1]
+
+                # "unconfident" losses: the same per-pixel CE over the complementary pixel set
+                # (conf < thresh instead of >=), with the same normalizer, so
+                # loss_u_s + loss_u_s_unconf is the CE mean over all valid pixels.
+                # Kept in the graph (not detached) but not added to the loss and not
+                # backpropagated yet; logged only for now.
+                # Each unconfident loss is further split by whether the pseudo-label (the EMA
+                # teacher's argmax, i.e. the CE target) matches the GT (pixels with GT == 255
+                # are neither correct nor incorrect).
+                # Each half is normalized as if the other half's pixels were removed from the
+                # image, i.e. by (#valid - #other), clamped to >= 1.
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
+                    loss_u_s1_unconf = loss_u_s1 * ((conf_u_w_cutmixed1 < cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                    loss_u_s1_unconf = loss_u_s1_unconf.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
+                    with torch.no_grad():
+                        unconf_known1 = (conf_u_w_cutmixed1 < cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255) & (mask_u_gt_cutmixed1 != 255)
+                        correct1 = unconf_known1 & (mask_u_w_cutmixed1 == mask_u_gt_cutmixed1)
+                        incorrect1 = unconf_known1 & ~correct1
+                        n_valid1 = (ignore_mask_cutmixed1 != 255).sum().item()
+                    loss_u_s1_unconf_correct = (loss_u_s1 * correct1).sum() / max(n_valid1 - incorrect1.sum().item(), 1)
+                    loss_u_s1_unconf_incorrect = (loss_u_s1 * incorrect1).sum() / max(n_valid1 - correct1.sum().item(), 1)
                     loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
                     loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
                     loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
+                    loss_u_s2_unconf = loss_u_s2 * ((conf_u_w_cutmixed2 < cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                    loss_u_s2_unconf = loss_u_s2_unconf.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+                    with torch.no_grad():
+                        unconf_known2 = (conf_u_w_cutmixed2 < cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255) & (mask_u_gt_cutmixed2 != 255)
+                        correct2 = unconf_known2 & (mask_u_w_cutmixed2 == mask_u_gt_cutmixed2)
+                        incorrect2 = unconf_known2 & ~correct2
+                        n_valid2 = (ignore_mask_cutmixed2 != 255).sum().item()
+                    loss_u_s2_unconf_correct = (loss_u_s2 * correct2).sum() / max(n_valid2 - incorrect2.sum().item(), 1)
+                    loss_u_s2_unconf_incorrect = (loss_u_s2 * incorrect2).sum() / max(n_valid2 - correct2.sum().item(), 1)
                     loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
                     loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
                     loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
+                    loss_u_s_unconf = (loss_u_s1_unconf + loss_u_s2_unconf) / 2.0
+                    loss_u_s_unconf_correct = (loss_u_s1_unconf_correct + loss_u_s2_unconf_correct) / 2.0
+                    loss_u_s_unconf_incorrect = (loss_u_s1_unconf_incorrect + loss_u_s2_unconf_incorrect) / 2.0
+                # measure the gradients of the two unconfident losses before the graph is
+                # consumed: autograd.grad leaves .grad alone (so the optimizer step is unchanged)
+                # and retain_graph keeps the same forward (same CutMix, same complementary-dropout
+                # masks) for all three backward passes. Scaled like g_x / g_s so norms compare.
+                if unconf_grad:
+                    for loss_part, acc in ((loss_u_s_unconf_correct, grad_uc_acc), (loss_u_s_unconf_incorrect, grad_ui_acc)):
+                        grads = torch.autograd.grad(loss_part / (2.0 * accum), params, retain_graph=True, allow_unused=True)
+                        for g_acc, g in zip(acc, grads):
+                            if g is not None:
+                                g_acc += g
+                        del grads
                 (loss_u_s / (2.0 * accum)).backward()
 
                 loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
@@ -295,29 +357,44 @@ def main():
                 group_loss += loss.item() / accum
                 group_loss_x += loss_x.item() / accum
                 group_loss_s += loss_u_s.item() / accum
+                group_loss_s_unconf += loss_u_s_unconf.item() / accum
+                group_loss_s_unconf_correct += loss_u_s_unconf_correct.item() / accum
+                group_loss_s_unconf_incorrect += loss_u_s_unconf_incorrect.item() / accum
 
                 total_loss.update(loss.item())
                 total_loss_x.update(loss_x.item())
                 total_loss_s.update(loss_u_s.item())
+                total_loss_s_unconf.update(loss_u_s_unconf.item())
+                total_loss_s_unconf_correct.update(loss_u_s_unconf_correct.item())
+                total_loss_s_unconf_incorrect.update(loss_u_s_unconf_incorrect.item())
                 mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum()
                 total_mask_ratio.update(mask_ratio.item())
 
-            # norms/cosine of the supervised vs unsupervised parts of this step's
-            # gradient, as applied (i.e. including the 1/(2*accum) loss scaling)
-            stats = torch.zeros(3, dtype=torch.float64, device='cuda')
-            for p, g_x in zip(params, grad_x_acc):
+            # norms/cosines of the supervised (x), unsupervised (s) and, if enabled, the
+            # unconfident-correct (uc) / -incorrect (ui) gradients of this step, as applied
+            # (i.e. including the 1/(2*accum) loss scaling)
+            stats = torch.zeros(10, dtype=torch.float64, device='cuda')
+            for i, (p, g_x) in enumerate(zip(params, grad_x_acc)):
                 if p.grad is None:
                     continue
                 g_s = p.grad - g_x
-                stats += torch.stack((
-                    (g_x * g_x).sum(dtype=torch.float64),
-                    (g_s * g_s).sum(dtype=torch.float64),
-                    (g_x * g_s).sum(dtype=torch.float64)
-                ))
-            norm_x_sq, norm_s_sq, dot_xs = stats.tolist()
+                terms = [g_x * g_x, g_s * g_s, g_x * g_s]
+                if unconf_grad:
+                    g_uc, g_ui = grad_uc_acc[i], grad_ui_acc[i]
+                    terms += [g_uc * g_uc, g_ui * g_ui, g_uc * g_x, g_uc * g_s, g_ui * g_x, g_ui * g_s, g_uc * g_ui]
+                stats[:len(terms)] += torch.stack([t.sum(dtype=torch.float64) for t in terms])
+            (norm_x_sq, norm_s_sq, dot_xs,
+             norm_uc_sq, norm_ui_sq, dot_uc_x, dot_uc_s, dot_ui_x, dot_ui_s, dot_uc_ui) = stats.tolist()
             grad_norm_x, grad_norm_s = norm_x_sq ** 0.5, norm_s_sq ** 0.5
             grad_ratio_s_x = grad_norm_s / max(grad_norm_x, 1e-12)
             grad_cos_x_s = dot_xs / max(grad_norm_x * grad_norm_s, 1e-12)
+            if unconf_grad:
+                grad_norm_uc, grad_norm_ui = norm_uc_sq ** 0.5, norm_ui_sq ** 0.5
+                grad_cos_x_uc = dot_uc_x / max(grad_norm_x * grad_norm_uc, 1e-12)
+                grad_cos_s_uc = dot_uc_s / max(grad_norm_s * grad_norm_uc, 1e-12)
+                grad_cos_x_ui = dot_ui_x / max(grad_norm_x * grad_norm_ui, 1e-12)
+                grad_cos_s_ui = dot_ui_s / max(grad_norm_s * grad_norm_ui, 1e-12)
+                grad_cos_uc_ui = dot_uc_ui / max(grad_norm_uc * grad_norm_ui, 1e-12)
             grad_cos_total_steps += 1
             grad_cos_conflict_steps += int(grad_cos_x_s < GRAD_COS_CONFLICT_THRESH)
             grad_cos_conflict_pct = 100.0 * grad_cos_conflict_steps / grad_cos_total_steps
@@ -336,7 +413,7 @@ def main():
             for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
                 buffer_ema.copy_(buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio))
 
-            wandb.log({
+            log = {
                 'train/loss_all': group_loss,
                 'train/loss_x': group_loss_x,
                 'train/loss_s': group_loss_s,
@@ -347,12 +424,25 @@ def main():
                 'grad/grad_cos_x_s': grad_cos_x_s,
                 'grad/grad_cos_x_s_lt_%g_pct' % GRAD_COS_CONFLICT_THRESH: grad_cos_conflict_pct,
                 'iters': iters
-            })
+            }
+            if unconf_grad:
+                log.update({
+                    'grad/grad_norm_unconf_correct': grad_norm_uc,
+                    'grad/grad_norm_unconf_incorrect': grad_norm_ui,
+                    'grad/grad_cos_x_unconf_correct': grad_cos_x_uc,
+                    'grad/grad_cos_s_unconf_correct': grad_cos_s_uc,
+                    'grad/grad_cos_x_unconf_incorrect': grad_cos_x_ui,
+                    'grad/grad_cos_s_unconf_incorrect': grad_cos_s_ui,
+                    'grad/grad_cos_unconf_correct_incorrect': grad_cos_uc_ui
+                })
+            wandb.log(log)
 
             if step % max(steps_per_epoch // 8, 1) == 0:
-                logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Mask ratio: '
-                            '{:.3f}'.format(step, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg,
-                                            total_loss_s.avg, total_mask_ratio.avg))
+                logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss s unconf: {:.3f} '
+                            '(correct: {:.3f}, incorrect: {:.3f}), Mask ratio: {:.3f}'.format(
+                                step, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, total_loss_s.avg,
+                                total_loss_s_unconf.avg, total_loss_s_unconf_correct.avg, total_loss_s_unconf_incorrect.avg,
+                                total_mask_ratio.avg))
 
             # skip the first steps when timing: cudnn.benchmark autotunes there
             if step == 4:
