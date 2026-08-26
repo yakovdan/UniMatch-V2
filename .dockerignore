@@ -1,0 +1,14 @@
+# The build context is the repo root; without this file every build ships multi-GB of
+# unused content to the daemon. The Dockerfile only COPYies data/PASCAL/, pretrained/,
+# dataset/, model/, util/, configs/, splits/, supervised.py, unimatch_v2_1gpu.py and
+# docker/{requirements-docker.txt,image-constraints.txt,entrypoint.sh}.
+.git/
+.idea/
+exp/
+training-logs/
+replication-results/
+data/checkpoints/
+data/SegmentationClass.zip
+unimatch_v2.pdf
+remote-sensing/
+**/__pycache__/

@@ -1,0 +1,31 @@
+# Packages needed on top of pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime.
+#
+# The base image ships torch/torchvision/triton, numpy, pillow and pyyaml, which covers
+# the rest of unimatch_v2_1gpu.py's import closure (dataset/, model/, util/,
+# supervised.py). ../requirements.txt lists more (opencv-python, scipy, scikit-*,
+# einops, h5py, easydict, TensorBoardX) but nothing in this script's module closure
+# imports them, and skipping opencv also avoids needing system libGL in a -runtime image.
+#
+# wandb: unimatch_v2_1gpu.py and supervised.py log training/eval metrics to it (the
+# image's import closure is tensorboard-free since both migrated off SummaryWriter).
+# Pass -e WANDB_API_KEY at `docker run` for online mode; USE_WANDB=offline|disabled
+# overrides the config's wandb_mode.
+#
+# xformers: pinned by direct URL, deliberately. PyPI and download.pytorch.org/whl/cu130
+# both host a wheel with the IDENTICAL filename xformers-0.0.35-py39-none-*.whl but
+# DIFFERENT binaries: the PyPI one is built against torch 2.10.0+cu128 and its C++/CUDA
+# extensions refuse to load here; the cu130-index one below is built against
+# torch 2.10.0+cu130 — exactly this image's torch — so the extensions load and the
+# native memory-efficient-attention kernels are used (no WARNING[XFORMERS] at import).
+# xformers checks nothing but whether _C.so links against the installed libtorch, which
+# is why the base image was downgraded to torch 2.10.0 in the first place: no prebuilt
+# xformers exists for torch 2.12. The .so is CPython-ABI-independent (py39-none tag),
+# so the image's Python 3.12 vs the wheel's build-time 3.10 is irrelevant — verified
+# 2026-08-24 with extension load + attention fwd+bwd on GPU under py3.12/torch 2.10.0.
+#
+# Install with:  pip install -c image-constraints.txt -r requirements-docker.txt
+# The constraints file pins every distribution the base image ships, so a transitive
+# dependency that wants a different torch/numpy fails loudly instead of silently
+# swapping it.
+wandb==0.28.2
+xformers @ https://download.pytorch.org/whl/cu130/xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl
