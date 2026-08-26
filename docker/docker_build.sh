@@ -36,9 +36,13 @@ SHORT_SHA=${RAW_SHA:0:12}
 GIT_SHA=$RAW_SHA
 
 if [ -n "$(git status --porcelain -uno -- "${COPIED_PATHS[@]}")" ]; then
-    GIT_SHA="${RAW_SHA}-dirty"
+    # Hash the diff into the tag. Without it every dirty build of the same commit lands on
+    # the identical "<sha>-dirty" tag, so pushing one silently overwrites a DIFFERENT image
+    # already on the registry -- and an instance pulling that tag gets whichever build won.
+    TREE_HASH=$(git diff HEAD -- "${COPIED_PATHS[@]}" | sha256sum | cut -c1-8)
+    GIT_SHA="${RAW_SHA}-dirty-${TREE_HASH}"
     # Distinct tag too, so a dirty build never overwrites the immutable tag of a clean one.
-    SHORT_SHA="${SHORT_SHA}-dirty"
+    SHORT_SHA="${SHORT_SHA}-dirty-${TREE_HASH}"
     echo "WARNING: tracked files copied into the image have uncommitted changes."
     echo "         Tagging ${SHORT_SHA}; this build is NOT reproducible from git."
     git status --porcelain -uno -- "${COPIED_PATHS[@]}" | sed 's/^/           /'

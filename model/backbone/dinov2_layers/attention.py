@@ -9,6 +9,7 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
 import logging
+import os
 
 from torch import Tensor
 from torch import nn
@@ -17,13 +18,35 @@ from torch import nn
 logger = logging.getLogger("dinov2")
 
 
-try:
-    from xformers.ops import memory_efficient_attention, unbind, fmha
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    logger.warning("xFormers not available")
+# XFORMERS_DISABLED forces the plain-attention path in MemEffAttention.forward below.
+#
+# Why it is needed: xformers 0.0.35 has no fp32 attention kernel for Blackwell. Every fp32
+# backend (cutlassF-pt, fa3F) requires compute capability <= 9.0, and fa2F is bf16/fp16
+# only, so on an RTX 5090 (capability 12.0) an fp32 forward raises
+#   NotImplementedError: No operator found for `memory_efficient_attention_forward`
+# Training under --bf16 is unaffected (fa2F handles it), which is why this surfaces only at
+# the first epoch boundary: supervised.evaluate runs in fp32. On an RTX 4090 (8.9) cutlassF
+# covers fp32, so it never reproduces locally.
+#
+# xformers' own XFORMERS_DISABLED does not help -- as of 0.0.35 the import still succeeds --
+# and the vendored dinov2 code keys the fallback purely off ImportError, so the switch has
+# to live here. The fallback is mathematically the same attention, just without the fused
+# kernel: slower, and O(N^2) memory for the attention matrix.
+#
+# block.py and swiglu_ffn.py import xformers too and are deliberately left alone: block.py
+# only needs it for nested-tensor (list) inputs, which DPT never passes, and SwiGLU is used
+# by the giant backbone only.
+if os.environ.get("XFORMERS_DISABLED"):
+    logger.warning("xFormers disabled by XFORMERS_DISABLED; using plain attention")
     XFORMERS_AVAILABLE = False
+else:
+    try:
+        from xformers.ops import memory_efficient_attention, unbind, fmha
+
+        XFORMERS_AVAILABLE = True
+    except ImportError:
+        logger.warning("xFormers not available")
+        XFORMERS_AVAILABLE = False
 
 
 class Attention(nn.Module):

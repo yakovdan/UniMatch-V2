@@ -38,6 +38,13 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader ||
 # wandb.init() runs before the first batch and dies without a credential unless
 # USE_WANDB is offline/disabled, so a missing key here predicts an immediate exit.
 # Names only, never values: this log is world-readable via `vastai logs`.
+# WANDB_KEY wins over WANDB_API_KEY on purpose: on Vast the account-level WANDB_API_KEY is
+# injected into every instance and belongs to a different W&B account, so the per-run key
+# has to be able to override it, not merely fill in for it.
+if [ -n "${WANDB_KEY:-}" ]; then
+  export WANDB_API_KEY="$WANDB_KEY"
+  echo "WANDB_API_KEY <- WANDB_KEY (per-run override)"
+fi
 echo "--- credentials present (values not shown) ---"
 echo "  USE_WANDB=${USE_WANDB:-<unset, config decides>}"
 for v in WANDB_API_KEY WANDB_PROJECT WANDB_RUN_ID; do

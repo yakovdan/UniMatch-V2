@@ -12,8 +12,10 @@
 # ENTRYPOINT runs and onstart is ignored entirely -- do not pass both and expect both.)
 #
 # Everything training-related is read from the environment, because --onstart takes no
-# arguments. WANDB_API_KEY and the B2_* credentials arrive automatically: they are
-# account-level Vast env vars, injected into every instance this account creates.
+# arguments. The B2_* credentials arrive automatically as account-level Vast env vars,
+# injected into every instance this account creates -- and so does a WANDB_API_KEY that
+# belongs to the wrong W&B account for this project. Pass -e WANDB_KEY=<key> to override
+# it; see section 0b.
 
 PROFILE=/etc/profile.d/00-vast-env.sh
 ENVFILE=/etc/environment
@@ -34,6 +36,39 @@ if [ -d /root/.ssh ]; then
   [ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
   echo "onstart: /root/.ssh perms -> $(stat -c '%A %U:%G' /root/.ssh) | authorized_keys $(stat -c '%A' /root/.ssh/authorized_keys 2>/dev/null || echo absent)"
 fi
+
+# ---- 0b. W&B identity ------------------------------------------------------------------
+# Vast injects an ACCOUNT-LEVEL WANDB_API_KEY into every instance this account creates, and
+# that key belongs to `yakovdan`. This project logs to a different account, so the per-run
+# key is passed as WANDB_KEY (not an account-level name, hence no precedence ambiguity with
+# the injected one) and exported over WANDB_API_KEY here, after injection.
+#
+# Note this OVERRIDES, where Calcium's entrypoint.sh bridges WANDB_KEY only as a fallback
+# (`${WANDB_API_KEY:-${WANDB_KEY:-}}`). A fallback cannot help here: the wrong value is
+# already set by the time onstart runs.
+if [ -n "${WANDB_KEY:-}" ]; then
+  export WANDB_API_KEY="$WANDB_KEY"
+  echo "onstart: WANDB_API_KEY <- WANDB_KEY (overriding the account-level key)"
+fi
+
+# Resolve the key to a username before training starts. Six minutes into a run is a late
+# and expensive moment to discover the wrong W&B account; `|| true` keeps a network hiccup
+# from blocking the launch.
+python - <<'PYIDENT' || true
+import base64, json, os, urllib.request
+key = os.environ.get("WANDB_API_KEY")
+if not key:
+    print("onstart: W&B identity: no key set"); raise SystemExit
+req = urllib.request.Request("https://api.wandb.ai/graphql",
+    data=json.dumps({"query": "{viewer{username entity}}"}).encode(),
+    headers={"Content-Type": "application/json",
+             "Authorization": "Basic " + base64.b64encode(f"api:{key}".encode()).decode()})
+try:
+    v = json.load(urllib.request.urlopen(req, timeout=20))["data"]["viewer"]
+    print(f"onstart: W&B identity: username={v.get('username')} entity={v.get('entity')}")
+except Exception as e:
+    print(f"onstart: W&B identity check failed: {e}")
+PYIDENT
 
 # ---- 1. make the container env visible to SSH sessions -------------------------------
 # SSH launch mode builds a clean env per session: without this, WANDB_API_KEY and B2_* are
@@ -77,6 +112,22 @@ python -c 'import torch; print("torch", torch.__version__, "cuda_ok", torch.cuda
 echo "--- /dev/shm (dataloader workers; Vast sizes it from the GPU fraction) ---"
 df -h /dev/shm || true
 
+# Blackwell and newer (capability >= 10) have no fp32 xformers attention kernel in 0.0.35,
+# and supervised.evaluate runs in fp32 -- so training completes epoch 0 and then dies at the
+# first evaluation with "No operator found for memory_efficient_attention_forward". Decide
+# it here from the actual GPU rather than trusting whoever writes the launch line to
+# remember; an explicitly passed value still wins. See model/backbone/dinov2_layers/attention.py.
+if [ -z "${XFORMERS_DISABLED:-}" ]; then
+  CAP=$(python -c 'import torch; print(torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0)' 2>/dev/null || echo 0)
+  if [ "${CAP:-0}" -ge 10 ]; then
+    export XFORMERS_DISABLED=1
+    echo "XFORMERS_DISABLED=1" >> /etc/environment
+    echo "onstart: GPU capability ${CAP}.x -- exporting XFORMERS_DISABLED=1 (no fp32 xformers kernel above 9.0)"
+  else
+    echo "onstart: GPU capability ${CAP}.x -- keeping xformers enabled"
+  fi
+fi
+
 # ---- 4. training arguments -------------------------------------------------------------
 # GGR_MODE / GGR_DIM / GGR_SCOPE / GGR_REORTH_EVERY need no plumbing: unimatch_v2_1gpu.py
 # reads them from the environment itself and they win over the command line.
@@ -101,7 +152,7 @@ TRAIN_ARGS=(
 
 echo "--- args: ${TRAIN_ARGS[*]} ---"
 echo "--- env ---"
-env | grep -E '^(USE_WANDB|WANDB_PROJECT|SPLIT|BACKBONE|EPOCHS|BF16|STOP_AFTER|GGR_|SEED|DETERMINISTIC)' | sort
+env | grep -E '^(USE_WANDB|WANDB_PROJECT|WANDB_ENTITY|SPLIT|BACKBONE|EPOCHS|BF16|STOP_AFTER|GGR_|SEED|DETERMINISTIC)' | sort
 for v in WANDB_API_KEY B2_KEY_ID B2_APP_KEY B2_BUCKET_NAME B2_S3_ENDPOINT; do
   if [ -n "${!v:-}" ]; then echo "  $v=<set>"; else echo "  $v=<MISSING>"; fi
 done
