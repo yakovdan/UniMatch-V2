@@ -45,11 +45,23 @@ parser.add_argument('--backbone', type=str, default=None, help='override the bac
 parser.add_argument('--epochs', type=int, default=None, help='override epochs in the config (also compresses the poly LR schedule)')
 parser.add_argument('--bf16', action='store_true', help='bf16 autocast for forwards/losses (recipe deviation: paper trains fp32)')
 parser.add_argument('--stop-after', type=int, default=None, help='debug: stop after N optimizer steps (smoke test)')
+parser.add_argument('--ggr', type=str, default='none', choices=['none', 'vlr', 'osr', 'csr'],
+                    help='rectify the unsupervised gradient against the supervised one (Chen et al., '
+                         'Geometric Gradient Rectification): vector-level, orthogonal-subspace or conic-subspace')
+parser.add_argument('--ggr-dim', type=int, default=10,
+                    help='subspace dimension d for --ggr osr/csr; ignored by vlr')
+parser.add_argument('--ggr-scope', type=str, default='all', choices=['backbone', 'head', 'all'],
+                    help='surgery scope P; the paper applies GGR to the encoder backbone by default')
+parser.add_argument('--ggr-reorth-every', type=int, default=0,
+                    help='re-orthonormalise U every N steps (0 = off; the Gram-Schmidt append already '
+                         're-projects, so drift is normally negligible)')
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
+GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
+GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
 
 
 def main():
@@ -204,10 +216,63 @@ def main():
 
         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
-    # accumulates the supervised (loss_x) part of the current optimizer step's
-    # gradient; the unsupervised part is recovered at step end as .grad minus this
+    # grad_x_acc accumulates the supervised (loss_x) part of the current optimizer
+    # step's gradient; grad_s_acc receives the unsupervised part at step end as
+    # .grad minus grad_x_acc. Both are lists of *views* into one contiguous flat
+    # buffer, so the same memory is addressable per-parameter (for accumulation)
+    # and as a single D-vector (for the GGR projections, which are defined on the
+    # flattened scope). model.parameters() yields the backbone first, so every
+    # surgery scope is a contiguous slice of both the param list and the buffer.
     params = [p for p in model.parameters() if p.requires_grad]
-    grad_x_acc = [torch.zeros_like(p) for p in params]
+    n_backbone = len([p for p in model.backbone.parameters() if p.requires_grad])
+    assert all(a is b for a, b in zip(params[:n_backbone],
+                                      (p for p in model.backbone.parameters() if p.requires_grad))), \
+        'expected the trainable backbone parameters to come first in model.parameters()'
+    numels = [p.numel() for p in params]
+    D_total = sum(numels)
+    D_backbone = sum(numels[:n_backbone])
+
+    def _flat_views(flat):
+        views, off = [], 0
+        for p, n in zip(params, numels):
+            views.append(flat[off:off + n].view_as(p))
+            off += n
+        return views
+
+    flat_x = torch.zeros(D_total, device=params[0].device, dtype=params[0].dtype)
+    flat_s = torch.zeros(D_total, device=params[0].device, dtype=params[0].dtype)
+    grad_x_acc = _flat_views(flat_x)
+    grad_s_acc = _flat_views(flat_s)
+
+    # surgery scope P: a contiguous [lo, hi) slice of the flat buffer and the
+    # matching [p_lo, p_hi) slice of the parameter list
+    if args.ggr_scope == 'backbone':
+        scope_lo, scope_hi, scope_p_lo, scope_p_hi = 0, D_backbone, 0, n_backbone
+    elif args.ggr_scope == 'head':
+        scope_lo, scope_hi, scope_p_lo, scope_p_hi = D_backbone, D_total, n_backbone, len(params)
+    else:
+        scope_lo, scope_hi, scope_p_lo, scope_p_hi = 0, D_total, 0, len(params)
+    D_scope = scope_hi - scope_lo
+
+    # U holds an orthonormal basis of the d most recent supervised directions,
+    # stored row-major as (d, D_scope) so each basis vector is contiguous.
+    # u_k counts the filled rows; u_ptr is the ring-buffer slot the next append
+    # overwrites (i.e. the oldest direction). U is deliberately not checkpointed:
+    # it rebuilds from scratch in d optimizer steps after a resume.
+    U, u_k, u_ptr, ggr_scratch = None, 0, 0, None
+    if args.ggr != 'none':
+        if D_scope == 0:
+            raise ValueError('--ggr %s --ggr-scope %s selects no trainable parameters '
+                             '(lock_backbone?)' % (args.ggr, args.ggr_scope))
+        logger.info('GGR: mode=%s scope=%s D=%.2fM' % (args.ggr, args.ggr_scope, D_scope / 1e6))
+        if args.ggr in ('osr', 'csr'):
+            if args.ggr_dim <= 0:
+                raise ValueError('--ggr %s needs --ggr-dim > 0' % args.ggr)
+            U = torch.zeros(args.ggr_dim, D_scope, device=flat_x.device, dtype=flat_x.dtype)
+            ggr_scratch = torch.empty(D_scope, device=flat_x.device, dtype=flat_x.dtype)
+            logger.info('GGR: d=%d, U occupies %.2f GiB' % (
+                args.ggr_dim, U.numel() * U.element_size() / 2 ** 30))
+        logger.info('')
 
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -226,8 +291,9 @@ def main():
 
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
-            for g_x in grad_x_acc:
-                g_x.zero_()
+            # one kernel each, now that the per-parameter buffers are views into these
+            flat_x.zero_()
+            flat_s.zero_()
 
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
@@ -303,18 +369,24 @@ def main():
                 total_mask_ratio.update(mask_ratio.item())
 
             # norms/cosine of the supervised vs unsupervised parts of this step's
-            # gradient, as applied (i.e. including the 1/(2*accum) loss scaling)
-            stats = torch.zeros(3, dtype=torch.float64, device='cuda')
-            for p, g_x in zip(params, grad_x_acc):
+            # gradient, as applied (i.e. including the 1/(2*accum) loss scaling).
+            # The reduction is split at the surgery-scope boundary so GGR gets the
+            # scope-restricted inner products for free; the whole-model figures the
+            # existing diagnostics use are just the two halves summed.
+            stats_scope = torch.zeros(3, dtype=torch.float64, device='cuda')
+            stats_rest = torch.zeros(3, dtype=torch.float64, device='cuda')
+            for i, (p, g_x, g_s) in enumerate(zip(params, grad_x_acc, grad_s_acc)):
                 if p.grad is None:
-                    continue
-                g_s = p.grad - g_x
-                stats += torch.stack((
+                    continue  # flat_s was zeroed at the top of the step
+                torch.subtract(p.grad, g_x, out=g_s)
+                tgt = stats_scope if scope_p_lo <= i < scope_p_hi else stats_rest
+                tgt += torch.stack((
                     (g_x * g_x).sum(dtype=torch.float64),
                     (g_s * g_s).sum(dtype=torch.float64),
                     (g_x * g_s).sum(dtype=torch.float64)
                 ))
-            norm_x_sq, norm_s_sq, dot_xs = stats.tolist()
+            norm_x_sq, norm_s_sq, dot_xs = (stats_scope + stats_rest).tolist()
+            scope_norm_x_sq, scope_norm_s_sq, scope_dot_xs = stats_scope.tolist()
             grad_norm_x, grad_norm_s = norm_x_sq ** 0.5, norm_s_sq ** 0.5
             grad_ratio_s_x = grad_norm_s / max(grad_norm_x, 1e-12)
             grad_cos_x_s = dot_xs / max(grad_norm_x * grad_norm_s, 1e-12)
@@ -322,9 +394,92 @@ def main():
             grad_cos_conflict_steps += int(grad_cos_x_s < GRAD_COS_CONFLICT_THRESH)
             grad_cos_conflict_pct = 100.0 * grad_cos_conflict_steps / grad_cos_total_steps
 
-            optimizer.step()
-
             iters = epoch * steps_per_epoch + step
+
+            # ------------------------------ GGR ------------------------------
+            # Chen et al., "Geometric Gradient Rectification for Safe Open-Set SSL".
+            # The supervised gradient is the anchor and is never modified; only the
+            # unsupervised part is projected, and the two are then re-summed into
+            # .grad. This runs after the raw-conflict diagnostics above and before
+            # optimizer.step(), so grad/grad_cos_x_s keeps its meaning as the
+            # *pre*-rectification conflict metric (paper section C.1) while
+            # grad/ggr_cos_after is the post-rectification (applied) one.
+            ggr_stats = {}
+            if args.ggr != 'none':
+                g_x_scope = flat_x[scope_lo:scope_hi]  # the paper's g_s, the anchor
+                g_u_scope = flat_s[scope_lo:scope_hi]  # the paper's g_u, the auxiliary
+                delta_norm = 0.0
+
+                if args.ggr in ('osr', 'csr'):
+                    # UpdateSubspace (Alg. 1 lines 14-19): keep only the part of the
+                    # current anchor that span(U) does not already contain, normalise
+                    # it, and write it over the oldest basis vector.
+                    v = ggr_scratch.copy_(g_x_scope)
+                    for _ in range(2):  # project twice: fp32 Gram-Schmidt loses orthogonality once
+                        if u_k > 0:
+                            v -= (U[:u_k] @ v) @ U[:u_k]
+                    nv = v.norm().item()
+                    if nv > GGR_MIN_RESIDUAL:
+                        U[u_ptr] = v / nv
+                        u_ptr = (u_ptr + 1) % U.shape[0]
+                        u_k = min(u_k + 1, U.shape[0])
+
+                if args.ggr == 'vlr':
+                    # Eq. (5): fires only on a conflict, and removes exactly the
+                    # component of g_u that points along -g_s.
+                    if scope_dot_xs < 0.0 and scope_norm_x_sq > 0.0:
+                        c = scope_dot_xs / scope_norm_x_sq  # c < 0 here
+                        g_u_scope.add_(g_x_scope, alpha=-c)  # -c > 0: injects |c|*g_x
+                        delta_norm = abs(scope_dot_xs) / scope_norm_x_sq ** 0.5
+                        ggr_stats['grad/ggr_fired'] = 1.0
+                    else:
+                        ggr_stats['grad/ggr_fired'] = 0.0
+                elif u_k > 0:
+                    coef = U[:u_k] @ g_u_scope  # coordinates of g_u in the basis
+                    if args.ggr == 'csr':
+                        # Eq. (8): clip only the coordinates opposing a stored anchor
+                        clipped = (coef < 0)
+                        ggr_stats['grad/ggr_fired'] = float(clipped.any().item())
+                        ggr_stats['grad/ggr_clipped_frac'] = clipped.float().mean().item()
+                        coef = coef.clamp(max=0.0)
+                    else:
+                        # Eq. (7): remove the whole component inside span(U)
+                        ggr_stats['grad/ggr_fired'] = 1.0
+                    # U has orthonormal rows, so ||U^T coef|| == ||coef||
+                    delta_norm = coef.norm().item()
+                    torch.addmv(g_u_scope, U[:u_k].t(), coef, beta=1.0, alpha=-1.0, out=g_u_scope)
+
+                # reassemble .grad = g_x + rectified g_u, on the scope only
+                for p, g_x, g_s in zip(params[scope_p_lo:scope_p_hi],
+                                       grad_x_acc[scope_p_lo:scope_p_hi],
+                                       grad_s_acc[scope_p_lo:scope_p_hi]):
+                    if p.grad is None:
+                        continue
+                    torch.add(g_x, g_s, out=p.grad)
+
+                # applied-conflict diagnostics: >= 0 for vlr (Prop. 2), ~0 for osr
+                # once the anchor is in span(U) (Prop. 4)
+                dot_after = torch.dot(g_x_scope, g_u_scope).item()
+                norm_s_after = g_u_scope.norm().item()
+                ggr_stats.update({
+                    'grad/ggr_cos_after': dot_after / max(scope_norm_x_sq ** 0.5 * norm_s_after, 1e-12),
+                    'grad/ggr_delta_norm': delta_norm,
+                    'grad/ggr_delta_rel': delta_norm / max(scope_norm_s_sq ** 0.5, 1e-12),
+                    'grad/ggr_subspace_k': float(u_k),
+                })
+
+                if U is not None and u_k > 1:
+                    if args.ggr_reorth_every and iters % args.ggr_reorth_every == 0:
+                        for a in range(u_k):  # modified Gram-Schmidt, in place
+                            for b in range(a):
+                                U[a] -= torch.dot(U[b], U[a]) * U[b]
+                            U[a] /= U[a].norm().clamp_min(1e-12)
+                    if GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
+                        gram = U[:u_k] @ U[:u_k].t() - torch.eye(u_k, device=U.device, dtype=U.dtype)
+                        ggr_stats['grad/ggr_orth_err'] = gram.abs().max().item()
+            # ---------------------------- end GGR ----------------------------
+
+            optimizer.step()
             lr = cfg['lr'] * (1 - iters / total_steps) ** 0.9
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg['lr_multi']
@@ -346,7 +501,8 @@ def main():
                 'grad/grad_norm_s_over_x': grad_ratio_s_x,
                 'grad/grad_cos_x_s': grad_cos_x_s,
                 'grad/grad_cos_x_s_lt_%g_pct' % GRAD_COS_CONFLICT_THRESH: grad_cos_conflict_pct,
-                'iters': iters
+                'iters': iters,
+                **ggr_stats
             })
 
             if step % max(steps_per_epoch // 8, 1) == 0:
