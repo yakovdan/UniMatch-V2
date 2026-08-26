@@ -50,6 +50,7 @@ parser.add_argument('--port', default=None, type=int)
 
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
+CLASS_GRAD_EMA_BETA = 0.95  # decay of the per-class supervised gradient EMA (see SUP_CLASS_GRAD_EMA)
 
 
 def main():
@@ -105,11 +106,12 @@ def main():
         id=run_id,
         resume='allow'
     )
-    # train/* and grad/* are logged per optimizer step, eval/* per epoch
+    # train/*, grad/* and grad_ema/* are logged per optimizer step, eval/* per epoch
     wandb.define_metric('iters')
     wandb.define_metric('epoch')
     wandb.define_metric('train/*', step_metric='iters')
     wandb.define_metric('grad/*', step_metric='iters')
+    wandb.define_metric('grad_ema/*', step_metric='iters')
     wandb.define_metric('eval/*', step_metric='epoch')
 
     cudnn.enabled = True
@@ -155,6 +157,20 @@ def main():
         raise NotImplementedError('%s criterion is not implemented' % cfg['criterion']['name'])
 
     criterion_u = nn.CrossEntropyLoss(reduction='none').cuda()
+
+    # Per-class EMA of the supervised classifier gradient: for every GT class c, an EMA over the
+    # optimizer steps where c occurs of the gradient of the class's own mean CE over the effective
+    # batch w.r.t. the classifier only (the final 1x1 conv of the DPT head, dpt.py output_conv[2]),
+    #   g_c = d/dtheta_cls [ sum_{p: mask_x[p] = c} CE_p / N_c ].
+    # Measured only, never applied. autograd.grad w.r.t. those params only backprops through the
+    # CE and that conv, so the extra cost is small; SUP_CLASS_GRAD_EMA=0 disables it.
+    class_grad_ema = os.environ.get('SUP_CLASS_GRAD_EMA', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    if class_grad_ema:
+        if cfg['criterion']['name'] != 'CELoss':
+            raise NotImplementedError('the per-class supervised gradient EMA needs the CELoss criterion (OHEM\'s '
+                                      'per-pixel selection is not decomposed); set SUP_CLASS_GRAD_EMA=0 to skip it')
+        # per-pixel CE with the same kwargs (ignore_index) as criterion_l
+        criterion_l_pix = nn.CrossEntropyLoss(**{**cfg['criterion']['kwargs'], 'reduction': 'none'}).cuda()
 
     trainset_u = SemiDataset(
         cfg['dataset'], cfg['data_root'], 'train_u', cfg['crop_size'], args.unlabeled_id_path
@@ -216,6 +232,25 @@ def main():
     grad_uc_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
     grad_ui_acc = [torch.zeros_like(p) for p in params] if unconf_grad else None
 
+    if class_grad_ema:
+        cls_params = [p for p in model.head.scratch.output_conv[2].parameters() if p.requires_grad]
+        n_cls_params = sum(p.numel() for p in cls_params)
+        class_names = CLASSES[cfg['dataset']]
+        logger.info('Per-class supervised classifier-gradient EMA: {} classes x {} classifier params, beta={} '
+                    '(set SUP_CLASS_GRAD_EMA=0 to skip)'.format(cfg['nclass'], n_cls_params, CLASS_GRAD_EMA_BETA))
+        # one flat (n_cls_params,) row per class, in `cls_params` order (weight, bias); a row is
+        # meaningless until the class's first update (grad_ema_cls_updates[c] > 0), which initializes it
+        grad_ema_cls = torch.zeros(cfg['nclass'], n_cls_params, device='cuda')
+        grad_ema_cls_updates = [0] * cfg['nclass']
+        grad_ema_path = os.path.join(args.save_path, 'grad_ema.pth')
+        if os.path.exists(os.path.join(args.save_path, 'latest.pth')) and os.path.exists(grad_ema_path):
+            grad_ema_ckpt = torch.load(grad_ema_path, map_location='cpu')
+            grad_ema_cls.copy_(grad_ema_ckpt['grad_ema_cls'])
+            grad_ema_cls_updates = grad_ema_ckpt['updates']
+            logger.info('************ Loaded per-class gradient EMA from {}\n'.format(grad_ema_path))
+    else:
+        logger.info('Per-class supervised gradient EMA: off (SUP_CLASS_GRAD_EMA=0)')
+
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
                     'EMA: {:.2f} @epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
@@ -238,11 +273,16 @@ def main():
             optimizer.zero_grad()
             for g_x in grad_x_acc:
                 g_x.zero_()
+            # this step's per-class sums of d/dtheta_cls sum_{p in c} CE_p and pixel counts N_c,
+            # for the classes present in the step; divided at step end to get the mean-CE gradient
+            cls_grad_sum, cls_pix_count = {}, {}
             if unconf_grad:
                 for g_uc, g_ui in zip(grad_uc_acc, grad_ui_acc):
                     g_uc.zero_()
                     g_ui.zero_()
-
+            # this step's per-class sums of d/dtheta_cls sum_{p in c} CE_p and pixel counts N_c,
+            # for the classes present in the step; divided at step end to get the mean-CE gradient
+            cls_grad_sum, cls_pix_count = {}, {}
             group_loss, group_loss_x, group_loss_s, group_loss_s_unconf = 0.0, 0.0, 0.0, 0.0
             group_loss_s_unconf_correct, group_loss_s_unconf_incorrect = 0.0, 0.0
 
@@ -271,6 +311,25 @@ def main():
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     pred_x = model(img_x)
                     loss_x = criterion_l(pred_x, mask_x)
+                    if class_grad_ema:
+                        ce_x_pix = criterion_l_pix(pred_x, mask_x)
+                # per-class classifier gradients first, with the graph retained; the existing
+                # supervised backward below then consumes it exactly as before
+                if class_grad_ema:
+                    for c in torch.unique(mask_x).tolist():
+                        if not 0 <= c < cfg['nclass']:  # ignore_index pixels belong to no class
+                            continue
+                        cls_mask = mask_x == c
+                        grads = torch.autograd.grad((ce_x_pix * cls_mask).sum(), cls_params, retain_graph=True)
+                        flat = torch.cat([g.reshape(-1) for g in grads])
+                        del grads
+                        if c in cls_grad_sum:
+                            cls_grad_sum[c] += flat
+                            cls_pix_count[c] += cls_mask.sum().item()
+                        else:
+                            cls_grad_sum[c] = flat
+                            cls_pix_count[c] = cls_mask.sum().item()
+                        del flat
                 grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
                 for p, g_x, g in zip(params, grad_x_acc, grads):
                     if g is None:
@@ -425,6 +484,7 @@ def main():
                 'grad/grad_cos_x_s_lt_%g_pct' % GRAD_COS_CONFLICT_THRESH: grad_cos_conflict_pct,
                 'iters': iters
             }
+
             if unconf_grad:
                 log.update({
                     'grad/grad_norm_unconf_correct': grad_norm_uc,
@@ -435,8 +495,24 @@ def main():
                     'grad/grad_cos_s_unconf_incorrect': grad_cos_s_ui,
                     'grad/grad_cos_unconf_correct_incorrect': grad_cos_uc_ui
                 })
+            if class_grad_ema:
+                # EMA update for the classes present in this step; the first observation
+                # initializes the class's row instead of decaying from zero
+                for c, g_sum in cls_grad_sum.items():
+                    g_c = g_sum / cls_pix_count[c]
+                    if grad_ema_cls_updates[c] == 0:
+                        grad_ema_cls[c].copy_(g_c)
+                    else:
+                        grad_ema_cls[c].mul_(CLASS_GRAD_EMA_BETA).add_(g_c, alpha=1 - CLASS_GRAD_EMA_BETA)
+                    grad_ema_cls_updates[c] += 1
+                    del g_c
+                cls_grad_sum, cls_pix_count = {}, {}
+                ema_norms = grad_ema_cls.norm(dim=1).tolist()
+                for c, name in enumerate(class_names):
+                    if grad_ema_cls_updates[c] > 0:
+                        log['grad_ema/norm_%s' % name] = ema_norms[c]
+                        log['grad_ema/updates_%s' % name] = grad_ema_cls_updates[c]
             wandb.log(log)
-
             if step % max(steps_per_epoch // 8, 1) == 0:
                 logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss s unconf: {:.3f} '
                             '(correct: {:.3f}, incorrect: {:.3f}), Mask ratio: {:.3f}'.format(
@@ -491,14 +567,17 @@ def main():
             'model_ema': model_ema.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
-            'previous_best': previous_best,
-            'previous_best_ema': previous_best_ema,
+            'previous_best': float(previous_best),  # numpy scalar from evaluate(); torch>=2.6 weights_only load rejects it
+            'previous_best_ema': float(previous_best_ema),
             'best_epoch': best_epoch,
             'best_epoch_ema': best_epoch_ema,
             'grad_cos_conflict_steps': grad_cos_conflict_steps,
             'grad_cos_total_steps': grad_cos_total_steps
         }
         torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+        if class_grad_ema:
+            torch.save({'grad_ema_cls': grad_ema_cls.cpu(), 'updates': grad_ema_cls_updates, 'beta': CLASS_GRAD_EMA_BETA},
+                       grad_ema_path)
         if is_best:
             torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
         if is_best_ema:
