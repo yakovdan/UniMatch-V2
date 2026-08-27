@@ -74,7 +74,7 @@ EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
 GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
 GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
-
+GGR_PROJ_LOG_EVERY = 1
 def boolean(raw):
     lowered = raw.strip().lower()
     if lowered in ('1', 'true', 'yes', 'on'):
@@ -373,7 +373,9 @@ def main():
     # u_k counts the filled rows; u_ptr is the ring-buffer slot the next append
     # overwrites (i.e. the oldest direction). U is deliberately not checkpointed:
     # it rebuilds from scratch in d optimizer steps after a resume.
-    U, u_k, u_ptr, ggr_scratch = None, 0, 0, None
+    # u_iters tracks which optimizer step wrote each row so a the age of row i
+    # is iters - u_iters[i]; It resets on resume like U itself does
+    U, u_k, u_ptr, u_iters, ggr_scratch = None, 0, 0, None, None
     if args.ggr != 'none':
         if D_scope == 0:
             raise ValueError('--ggr %s --ggr-scope %s selects no trainable parameters '
@@ -383,6 +385,8 @@ def main():
             if args.ggr_dim <= 0:
                 raise ValueError('--ggr %s needs --ggr-dim > 0' % args.ggr)
             U = torch.zeros(args.ggr_dim, D_scope, device=flat_x.device, dtype=flat_x.dtype)
+            u_iters = [None] * args.ggr_dim
+
             ggr_scratch = torch.empty(D_scope, device=flat_x.device, dtype=flat_x.dtype)
             logger.info('GGR: d=%d, U occupies %.2f GiB' % (
                 args.ggr_dim, U.numel() * U.element_size() / 2 ** 30))
@@ -539,12 +543,30 @@ def main():
                     # current anchor that span(U) does not already contain, normalise
                     # it, and write it over the oldest basis vector.
                     v = ggr_scratch.copy_(g_x_scope)
+                    coef_x = None
                     for _ in range(2):  # project twice: fp32 Gram-Schmidt loses orthogonality once
                         if u_k > 0:
-                            v -= (U[:u_k] @ v) @ U[:u_k]
+                            c = U[:u_k] @ v
+                            if coef_x is None:
+                                coef_x = c
+                            else:
+                                coef_x += c
+                            v -= c @ U[:u_k]
+                    if coef_x is not None and GGR_PROJ_LOG_EVERY and iters % GGR_PROJ_LOG_EVERY == 0:
+                        # rows are orthonormal, so ||coef_x|| == ||P_U g_x|| and
+                        # |coef_x[i]| / ||g_x|| == |cos(u_i, g_x)|; the per-row values sum
+                        # in squares to the total. Sorted by row age, youngest first.
+                        norm_x = max(scope_norm_x_sq ** 0.5, 1e-12)
+                        per_row = (coef_x.abs() / norm_x).tolist()
+                        by_age = sorted((iters - u_iters[i], per_row[i]) for i in range(u_k))
+                        logger.info('GGR proj: |P_U g_x| / |g_x| = %.4f over k=%d rows; '
+                                    '|cos(u_i, g_x)| by row age: %s' % (
+                                        coef_x.norm().item() / norm_x, u_k,
+                                        ' '.join('%d:%.4f' % (age, c) for age, c in by_age)))
                     nv = v.norm().item()
                     if nv > GGR_MIN_RESIDUAL:
                         U[u_ptr] = v / nv
+                        u_iters[u_ptr] = iters
                         u_ptr = (u_ptr + 1) % U.shape[0]
                         u_k = min(u_k + 1, U.shape[0])
 
