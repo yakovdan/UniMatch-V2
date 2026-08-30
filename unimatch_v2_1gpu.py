@@ -9,6 +9,7 @@ import time
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from util.optim import build_adamw
 from torch.utils.data import DataLoader
@@ -45,12 +46,33 @@ parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--data-root', type=str, default=None, help='override data_root in the config')
 parser.add_argument('--backbone', type=str, default=None, help='override the backbone in the config, e.g. dinov2_base')
 parser.add_argument('--epochs', type=int, default=None, help='override epochs in the config (also compresses the poly LR schedule)')
+parser.add_argument('--epoch-lim', '--epoch_lim', type=int, default=0,
+                    help='stop after this many epochs while the poly LR schedule still spans the full '
+                         "cfg['epochs'] (unlike --epochs, which compresses it). 0 = disabled [env: EPOCH_LIM]")
 parser.add_argument('--bf16', action='store_true', help='bf16 autocast for forwards/losses (recipe deviation: paper trains fp32)')
 parser.add_argument('--stop-after', type=int, default=None, help='debug: stop after N optimizer steps (smoke test)')
+parser.add_argument('--lr-multi', type=float, default=None,
+                    help="override lr_multi in the config: the head's LR is lr * lr_multi (config default 40) "
+                         '[env: LR_MULTI]')
+parser.add_argument('--lock-backbone', action='store_true',
+                    help="freeze the backbone (sets lock_backbone: True over the config): only the DPT head "
+                         'trains; the backbone stays at the DINOv2 checkpoint in both student and teacher '
+                         '[env: LOCK_BACKBONE]')
+parser.add_argument('--sup-only', action='store_true',
+                    help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
+                         'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
+                         'LR schedule and EMA are unchanged, so a run is seed-paired with the semi-supervised '
+                         'run on its supervised component; grad/* logs a zero unsupervised stub [env: SUP_ONLY]')
 parser.add_argument('--ggr', type=str, default='none', choices=['none', 'vlr', 'osr', 'csr'],
                     help='rectify the unsupervised gradient against the supervised one (Chen et al., '
                          'Geometric Gradient Rectification): vector-level, orthogonal-subspace or '
                          'conic-subspace [env: GGR_MODE]')
+parser.add_argument('--ggr-anchor', type=str, default='recent', choices=['recent', 'class'],
+                    help="what GGR rectifies against. 'recent': the current supervised gradient (vlr) or a "
+                         "ring buffer of the last --ggr-dim supervised gradients (osr/csr). 'class': per-class "
+                         'supervised gradients of the DPT head, EMA-averaged with the teacher schedule; osr/csr '
+                         'project onto their orthonormal basis (rarest class first), vlr against their '
+                         '1/pixel-frequency weighted sum. Requires --ggr-scope head [env: GGR_ANCHOR]')
 parser.add_argument('--ggr-dim', type=int, default=10,
                     help='subspace dimension d for --ggr osr/csr; ignored by vlr [env: GGR_DIM]')
 parser.add_argument('--ggr-scope', type=str, default='all', choices=['backbone', 'head', 'all'],
@@ -63,6 +85,16 @@ parser.add_argument('--ggr-reorth-every', type=int, default=0,
 parser.add_argument('--seed', type=int, default=0,
                     help='seed for model init, data order and augmentations. Each epoch is reseeded '
                          'from (seed, epoch), so a resume reproduces the original run [env: SEED]')
+parser.add_argument('--unlabeled-seed', type=int, default=None,
+                    help='seed the unlabeled branch (unlabeled order and augmentations, CutMix boxes, '
+                         'Complementary Dropout) separately from --seed, which then covers only head init '
+                         'and the labeled stream. Default: same as --seed. --seed A --unlabeled-seed B '
+                         'reproduces the unlabeled branch of the run seeded B exactly [env: UNLABELED_SEED]')
+parser.add_argument('--init-seed', type=int, default=None,
+                    help='seed the DPT head initialisation separately from --seed, which then covers only '
+                         'the labeled stream (and the unlabeled one unless --unlabeled-seed is set). '
+                         'Default: same as --seed. --seed A --init-seed B gives run B\'s head weights '
+                         'with run A\'s data streams [env: INIT_SEED]')
 parser.add_argument('--deterministic', action='store_true',
                     help='trade throughput for reproducibility: disable cudnn.benchmark and request '
                          'deterministic kernels. Some ops (bilinear interpolate backward) have no '
@@ -75,6 +107,34 @@ GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflic
 GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
 GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
 GGR_PROJ_LOG_EVERY = 1
+GGR_CLASS_MIN_NORM = 1e-12  # a class prototype below this has no direction to contribute
+
+
+def labeled_pixel_freq(cfg, id_path, save_path, logger):
+    """Pixel frequency of every class over the labeled split's masks (ignore 255), cached
+    next to the checkpoints. The 1/f_c weights of the class anchor come from this."""
+    import json
+    from PIL import Image
+    cache = os.path.join(save_path, 'class_pixel_freq.json')
+    if os.path.exists(cache):
+        freq = json.load(open(cache))
+        if len(freq) == cfg['nclass']:
+            return np.array(freq)
+    counts = np.zeros(cfg['nclass'], dtype=np.int64)
+    for line in open(id_path).read().splitlines():
+        if not line.strip():
+            continue
+        m = np.array(Image.open(os.path.join(cfg['data_root'], line.split()[-1])))
+        vals, n = np.unique(m, return_counts=True)
+        for v, k in zip(vals, n):
+            if v < cfg['nclass']:
+                counts[v] += k
+    freq = counts / counts.sum()
+    with open(cache, 'w') as f:
+        json.dump(freq.tolist(), f)
+    logger.info('labeled pixel frequencies (%s): %s' % (id_path, ' '.join(
+        '%s=%.4f' % (c, fr) for c, fr in zip(CLASSES[cfg['dataset']], freq))))
+    return freq
 def boolean(raw):
     lowered = raw.strip().lower()
     if lowered in ('1', 'true', 'yes', 'on'):
@@ -90,10 +150,17 @@ def boolean(raw):
 # instead. (env var, args attribute, type, allowed values or None)
 ENV_OVERRIDES = (
     ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr')),
+    ('GGR_ANCHOR', 'ggr_anchor', str, ('recent', 'class')),
     ('GGR_DIM', 'ggr_dim', int, None),
     ('GGR_SCOPE', 'ggr_scope', str, ('backbone', 'head', 'all')),
     ('GGR_REORTH_EVERY', 'ggr_reorth_every', int, None),
+    ('EPOCH_LIM', 'epoch_lim', int, None),
+    ('SUP_ONLY', 'sup_only', boolean, None),
+    ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
+    ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
+    ('UNLABELED_SEED', 'unlabeled_seed', int, None),
+    ('INIT_SEED', 'init_seed', int, None),
     ('DETERMINISTIC', 'deterministic', boolean, None),
 )
 
@@ -169,6 +236,16 @@ def main():
 
     # before all_args, so the effective values are what gets logged and sent to W&B
     apply_env_overrides(args, logger)
+    if args.lock_backbone:
+        cfg['lock_backbone'] = True
+    if args.lr_multi is not None:
+        cfg['lr_multi'] = args.lr_multi
+    args.lr_multi = cfg['lr_multi']  # so all_args / W&B record the effective value either way
+    if args.sup_only and args.ggr != 'none':
+        raise ValueError('--sup-only has no unsupervised gradient to rectify; drop --ggr %s' % args.ggr)
+    if args.ggr != 'none' and args.ggr_anchor == 'class' and args.ggr_scope != 'head':
+        raise ValueError('--ggr-anchor class builds its anchors in DPT-head space; use --ggr-scope head '
+                         '(got %s)' % args.ggr_scope)
     # before setup_distributed: the first CUDA call happens in there, and
     # CUBLAS_WORKSPACE_CONFIG has to be in place before cuBLAS initialises
     setup_determinism(args, logger)
@@ -225,6 +302,11 @@ def main():
         'large': {'encoder_size': 'large', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'giant': {'encoder_size': 'giant', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
+    if args.init_seed is not None:
+        # nothing between setup_determinism's seed_everything and this line draws from
+        # torch's RNG, and every epoch reseeds it before training, so this changes the
+        # head init (the backbone is overwritten from the checkpoint below) and nothing else
+        torch.manual_seed(args.init_seed)
     model = DPT(**{**model_configs[cfg['backbone'].split('_')[-1]], 'nclass': cfg['nclass']})
     state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
     model.backbone.load_state_dict(state_dict)
@@ -274,8 +356,9 @@ def main():
     # torch's worker-seeding, the augmentation RNGs inside the workers. Distinct
     # seeds so the labeled and unlabeled streams do not share a permutation.
     gen_l, gen_u, gen_val = (torch.Generator() for _ in range(3))
+    unlabeled_seed = args.seed if args.unlabeled_seed is None else args.unlabeled_seed
     gen_l.manual_seed(args.seed + 1)
-    gen_u.manual_seed(args.seed + 2)
+    gen_u.manual_seed(unlabeled_seed + 2)
     gen_val.manual_seed(args.seed + 3)
 
     trainloader_l = DataLoader(
@@ -302,6 +385,7 @@ def main():
     # (persisted in the checkpoint across resumes)
     grad_cos_conflict_steps, grad_cos_total_steps = 0, 0
 
+    resume_proto = (None, None)
     if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
         # weights_only=False: this file is written by the block at the end of this loop, so
         # it is as trusted as the script itself. The default flipped to True in torch 2.6,
@@ -321,6 +405,7 @@ def main():
         # .get: checkpoints written before these counters existed start counting from here
         grad_cos_conflict_steps = checkpoint.get('grad_cos_conflict_steps', 0)
         grad_cos_total_steps = checkpoint.get('grad_cos_total_steps', 0)
+        resume_proto = checkpoint.get('ggr_proto'), checkpoint.get('ggr_proto_updates')
 
         # per-epoch reseeding makes a resume reproducible only under the same seed
         ckpt_seed = checkpoint.get('seed')
@@ -376,12 +461,40 @@ def main():
     # u_iters tracks which optimizer step wrote each row so a the age of row i
     # is iters - u_iters[i]; It resets on resume like U itself does
     U, u_k, u_ptr, u_iters, ggr_scratch = None, 0, 0, None, None
+    # Class-prototype anchors (--ggr-anchor class): proto[c] is the EMA of the per-class
+    # supervised gradient (CE averaged over the pixels of class c) w.r.t. the head
+    # parameters, laid out like flat_x[D_backbone:]. proto_acc / proto_cnt gather the
+    # micro-batches of the current step; proto_updates counts EMA updates per class so
+    # each class runs the teacher's warm-up schedule from its own first appearance.
+    proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, head_params = (None,) * 7
+    if args.sup_only:
+        logger.info('supervised-only: unsupervised branch skipped; loss_s, mask_ratio and the '
+                    'grad/*_s diagnostics are a zero stub\n')
     if args.ggr != 'none':
         if D_scope == 0:
             raise ValueError('--ggr %s --ggr-scope %s selects no trainable parameters '
                              '(lock_backbone?)' % (args.ggr, args.ggr_scope))
         logger.info('GGR: mode=%s scope=%s D=%.2fM' % (args.ggr, args.ggr_scope, D_scope / 1e6))
-        if args.ggr in ('osr', 'csr'):
+        if args.ggr_anchor == 'class':
+            n_cls = cfg['nclass']
+            head_params = params[scope_p_lo:scope_p_hi]
+            proto = torch.zeros(n_cls, D_scope, device=flat_x.device, dtype=flat_x.dtype)
+            proto_acc = torch.zeros_like(proto)
+            proto_cnt = torch.zeros(n_cls, device=flat_x.device)
+            proto_updates = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
+            freq = labeled_pixel_freq(cfg, args.labeled_id_path, args.save_path, logger)
+            inv = np.where(freq > 0, 1.0 / np.maximum(freq, 1e-12), 0.0)
+            proto_w = torch.tensor(inv / inv.sum(), device=flat_x.device, dtype=flat_x.dtype)
+            # Gram-Schmidt order for the class basis: rarest class first, so the rare
+            # classes' gradient directions enter the basis unaltered and the common ones
+            # contribute only what is orthogonal to them
+            proto_order = torch.tensor(np.argsort(np.where(freq > 0, freq, np.inf)), device=flat_x.device)
+            if args.ggr in ('osr', 'csr'):
+                U = torch.zeros(n_cls, D_scope, device=flat_x.device, dtype=flat_x.dtype)
+            logger.info('GGR: class-prototype anchors, %d classes x D=%.2fM (%.2f GiB incl. basis); 1/f weights: %s' % (
+                n_cls, D_scope / 1e6, (2 + (U is not None)) * proto.numel() * proto.element_size() / 2 ** 30,
+                ' '.join('%s=%.3f' % (c, w) for c, w in zip(CLASSES[cfg['dataset']], proto_w.tolist()))))
+        elif args.ggr in ('osr', 'csr'):
             if args.ggr_dim <= 0:
                 raise ValueError('--ggr %s needs --ggr-dim > 0' % args.ggr)
             U = torch.zeros(args.ggr_dim, D_scope, device=flat_x.device, dtype=flat_x.dtype)
@@ -391,8 +504,20 @@ def main():
             logger.info('GGR: d=%d, U occupies %.2f GiB' % (
                 args.ggr_dim, U.numel() * U.element_size() / 2 ** 30))
         logger.info('')
+    if proto is not None and resume_proto[0] is not None and tuple(resume_proto[0].shape) == tuple(proto.shape):
+        proto.copy_(resume_proto[0].to(proto.device))
+        proto_updates.copy_(resume_proto[1].to(proto_updates.device))
+        logger.info('GGR: restored class prototypes for %d classes from the checkpoint\n' % int((proto_updates > 0).sum()))
 
-    for epoch in range(epoch + 1, cfg['epochs']):
+    # the loop bound is capped but total_steps above is not, so a limited run walks
+    # the first epoch_lim epochs of the full schedule instead of a compressed one
+    epoch_end = cfg['epochs']
+    if args.epoch_lim > 0:
+        epoch_end = min(cfg['epochs'], args.epoch_lim)
+        logger.info('epoch_lim=%d: running %d of %d epochs; LR schedule spans all %d\n' % (
+            args.epoch_lim, epoch_end, cfg['epochs'], cfg['epochs']))
+
+    for epoch in range(epoch + 1, epoch_end):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
                     'EMA: {:.2f} @epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
 
@@ -407,11 +532,22 @@ def main():
         # having to serialise RNG state into the checkpoint. Must happen before
         # the iterator below, which is when the samplers draw their permutations.
         epoch_seed = (args.seed + 100003 * (epoch + 1)) % 2 ** 31
+        epoch_seed_u = (unlabeled_seed + 100003 * (epoch + 1)) % 2 ** 31
         seed_everything(epoch_seed)
         gen_l.manual_seed(epoch_seed + 1)
-        gen_u.manual_seed(epoch_seed + 2)
+        gen_u.manual_seed(epoch_seed_u + 2)
+        if args.unlabeled_seed is not None:
+            # the only main-process RNG draws inside an epoch are Complementary Dropout's
+            # (torch CPU: Binomial sample + randperm, model/semseg/dpt.py), which belong to
+            # the unlabeled branch. Both loaders own their generators, so nothing on the
+            # labeled side reads this RNG. Identical to seed_everything's call when the
+            # two seeds coincide, hence the guard keeps the default path byte-for-byte.
+            torch.manual_seed(epoch_seed_u)
 
-        loader = iter(zip(trainloader_l, trainloader_u))
+        # In --sup-only mode the unlabeled loader is never iterated, so its workers
+        # never spawn and the strong-view augmentations are never computed. gen_l is
+        # per-loader, so the labeled order and augmentations are identical either way.
+        loader = iter(trainloader_l) if args.sup_only else iter(zip(trainloader_l, trainloader_u))
 
         model.train()
 
@@ -426,20 +562,23 @@ def main():
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
             for _ in range(accum):
-                (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
+                if args.sup_only:
+                    img_x, mask_x = next(loader)
+                else:
+                    (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
+                    img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()
+                    ignore_mask, cutmix_box1, cutmix_box2 = ignore_mask.cuda(), cutmix_box1.cuda(), cutmix_box2.cuda()
+                    mask_u_gt = mask_u_gt.cuda()  # GT of the unlabeled batch; not used by the loss yet
+
+                    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
+                        pred_u_w = model_ema(img_u_w).detach()
+                        conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+                        mask_u_w = pred_u_w.argmax(dim=1)
+
+                    img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = img_u_s1.flip(0)[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
+                    img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
 
                 img_x, mask_x = img_x.cuda(), mask_x.cuda()
-                img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()
-                ignore_mask, cutmix_box1, cutmix_box2 = ignore_mask.cuda(), cutmix_box1.cuda(), cutmix_box2.cuda()
-                mask_u_gt = mask_u_gt.cuda()  # GT of the unlabeled batch; not used by the loss yet
-
-                with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                    pred_u_w = model_ema(img_u_w).detach()
-                    conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-                    mask_u_w = pred_u_w.argmax(dim=1)
-
-                img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = img_u_s1.flip(0)[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
-                img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
 
                 # labeled and unlabeled losses live in separate graphs, so
                 # backward each part right after its forward to halve peak memory.
@@ -450,6 +589,25 @@ def main():
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                     pred_x = model(img_x)
                     loss_x = criterion_l(pred_x, mask_x)
+                if proto is not None:
+                    # per-class supervised gradients of the head: CE averaged over the pixels of
+                    # each class present in this micro-batch, one head-only backward per class
+                    # (the graph is kept for the full-loss backward below). Plain CE regardless
+                    # of criterion_l so the prototypes mean the same thing under OHEM.
+                    ce_px = F.cross_entropy(pred_x, mask_x, ignore_index=255, reduction='none')
+                    for c in mask_x.unique().tolist():
+                        if c == 255 or c >= proto.shape[0]:
+                            continue
+                        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), head_params,
+                                                  retain_graph=True, allow_unused=True)
+                        row, off = proto_acc[c], 0
+                        for p, g in zip(head_params, g_c):
+                            n = p.numel()
+                            if g is not None:
+                                row[off:off + n].add_(g.reshape(-1))
+                            off += n
+                        proto_cnt[c] += 1
+                    del ce_px, g_c
                 grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
                 for p, g_x, g in zip(params, grad_x_acc, grads):
                     if g is None:
@@ -458,31 +616,40 @@ def main():
                     p.grad = g.contiguous() if p.grad is None else p.grad.add_(g)
                 del grads
 
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                    pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2)), comp_drop=True).chunk(2)
+                if args.sup_only:
+                    # nothing else backwards into .grad, so at step end grad_s_acc = .grad - grad_x_acc
+                    # is exactly zero: the unsupervised stub every grad/* metric sees. The loss keeps
+                    # its (loss_x + loss_u_s) / 2 form so train/loss_all and the applied gradient
+                    # scale match the semi-supervised runs.
+                    loss_u_s = torch.zeros((), device=img_x.device)
+                    mask_ratio = 0.0
+                else:
+                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
+                        pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2)), comp_drop=True).chunk(2)
 
-                mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
-                mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+                    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+                    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
 
-                mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w.flip(0)[cutmix_box1 == 1]
-                conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w.flip(0)[cutmix_box1 == 1]
-                ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask.flip(0)[cutmix_box1 == 1]
+                    mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w.flip(0)[cutmix_box1 == 1]
+                    conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w.flip(0)[cutmix_box1 == 1]
+                    ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask.flip(0)[cutmix_box1 == 1]
 
-                mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w.flip(0)[cutmix_box2 == 1]
-                conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w.flip(0)[cutmix_box2 == 1]
-                ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask.flip(0)[cutmix_box2 == 1]
+                    mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w.flip(0)[cutmix_box2 == 1]
+                    conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w.flip(0)[cutmix_box2 == 1]
+                    ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask.flip(0)[cutmix_box2 == 1]
 
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                    loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-                    loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
-                    loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
+                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
+                        loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
+                        loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                        loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-                    loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-                    loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
-                    loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+                        loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
+                        loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                        loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
-                    loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
-                (loss_u_s / (2.0 * accum)).backward()
+                        loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
+                    (loss_u_s / (2.0 * accum)).backward()
+                    mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum().item()
 
                 loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
 
@@ -493,8 +660,7 @@ def main():
                 total_loss.update(loss.item())
                 total_loss_x.update(loss_x.item())
                 total_loss_s.update(loss_u_s.item())
-                mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum()
-                total_mask_ratio.update(mask_ratio.item())
+                total_mask_ratio.update(mask_ratio)
 
             # norms/cosine of the supervised vs unsupervised parts of this step's
             # gradient, as applied (i.e. including the 1/(2*accum) loss scaling).
@@ -537,8 +703,54 @@ def main():
                 g_x_scope = flat_x[scope_lo:scope_hi]  # the paper's g_s, the anchor
                 g_u_scope = flat_s[scope_lo:scope_hi]  # the paper's g_u, the auxiliary
                 delta_norm = 0.0
+                g_w = None
 
-                if args.ggr in ('osr', 'csr'):
+                if proto is not None:
+                    # 1. average each class over the micro-batches it appeared in, then EMA it
+                    #    with the teacher's schedule, run per class from its first appearance
+                    #    (r = 0 on the first update, so a new class starts at its observation)
+                    upd = proto_cnt > 0
+                    if upd.any():
+                        obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
+                        r = (1.0 - 1.0 / (proto_updates[upd].to(proto.dtype) + 1.0)).clamp(max=0.996).unsqueeze(1)
+                        proto[upd] = r * proto[upd] + (1.0 - r) * obs
+                        proto_updates[upd] += 1
+                        proto_acc.zero_()
+                        proto_cnt.zero_()
+                        del obs
+                    seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
+                    n_seen = int(seen.sum())
+                    # 2. anchors. vlr: the 1/f-weighted combination of the prototypes (weights
+                    #    renormalised over the classes seen so far). osr/csr: an orthonormal basis
+                    #    of the prototypes, Gram-Schmidt order rarest class first, signs fixed so
+                    #    each row points along its class's residual direction (csr clips against it).
+                    if n_seen > 0:
+                        if args.ggr == 'vlr':
+                            w = proto_w * seen
+                            w = w / w.sum()
+                            g_w = w @ proto
+                        else:
+                            order = [int(c) for c in proto_order.tolist() if seen[c]]
+                            Q, R = torch.linalg.qr(proto[order].t(), mode='reduced')  # (D, k)
+                            diag = R.diagonal()
+                            keep = diag.abs() > GGR_MIN_RESIDUAL
+                            Q = Q[:, keep] * diag[keep].sign()
+                            u_k = int(keep.sum())
+                            U[:u_k] = Q.t()
+                            del Q, R
+                    cos_u_proto = (proto @ g_u_scope) / (proto.norm(dim=1) * g_u_scope.norm()).clamp_min(1e-12)
+                    ggr_stats['grad/ggr_proto_classes'] = float(n_seen)
+                    for ci, cname in enumerate(CLASSES[cfg['dataset']]):
+                        if seen[ci]:
+                            ggr_stats['grad/proto_norm/%s' % cname] = proto[ci].norm().item()
+                            ggr_stats['grad/ggr_cos_u_proto/%s' % cname] = cos_u_proto[ci].item()
+                    if g_w is not None:
+                        norm_w = g_w.norm().item()
+                        ggr_stats['grad/ggr_gw_norm'] = norm_w
+                        ggr_stats['grad/ggr_cos_gw_gx'] = torch.dot(g_w, g_x_scope).item() / max(norm_w * scope_norm_x_sq ** 0.5, 1e-12)
+                        ggr_stats['grad/ggr_cos_u_gw_before'] = torch.dot(g_w, g_u_scope).item() / max(norm_w * scope_norm_s_sq ** 0.5, 1e-12)
+
+                if args.ggr in ('osr', 'csr') and proto is None:
                     # UpdateSubspace (Alg. 1 lines 14-19): keep only the part of the
                     # current anchor that span(U) does not already contain, normalise
                     # it, and write it over the oldest basis vector.
@@ -570,7 +782,22 @@ def main():
                         u_ptr = (u_ptr + 1) % U.shape[0]
                         u_k = min(u_k + 1, U.shape[0])
 
-                if args.ggr == 'vlr':
+                if args.ggr == 'vlr' and g_w is not None:
+                    # Eq. (5) against the weighted class anchor g_w instead of g_x
+                    dot_wu = torch.dot(g_w, g_u_scope).item()
+                    norm_w_sq = torch.dot(g_w, g_w).item()
+                    if dot_wu < 0.0 and norm_w_sq > 0.0:
+                        c = dot_wu / norm_w_sq
+                        g_u_scope.add_(g_w, alpha=-c)
+                        delta_norm = abs(dot_wu) / norm_w_sq ** 0.5
+                        ggr_stats['grad/ggr_fired'] = 1.0
+                    else:
+                        ggr_stats['grad/ggr_fired'] = 0.0
+                    ggr_stats['grad/ggr_cos_u_gw_after'] = torch.dot(g_w, g_u_scope).item() / max(
+                        norm_w_sq ** 0.5 * g_u_scope.norm().item(), 1e-12)
+                elif args.ggr == 'vlr' and proto is not None:
+                    ggr_stats['grad/ggr_fired'] = 0.0  # no class seen yet: nothing to anchor on
+                elif args.ggr == 'vlr':
                     # Eq. (5): fires only on a conflict, and removes exactly the
                     # component of g_u that points along -g_s.
                     if scope_dot_xs < 0.0 and scope_norm_x_sq > 0.0:
@@ -582,6 +809,11 @@ def main():
                         ggr_stats['grad/ggr_fired'] = 0.0
                 elif u_k > 0:
                     coef = U[:u_k] @ g_u_scope  # coordinates of g_u in the basis
+                    if proto is not None:
+                        # row i of the class basis is the residual direction of the i-th rarest
+                        # seen class; a negative coordinate is what csr clips
+                        for i, cidx in enumerate([int(c) for c in proto_order.tolist() if seen[c]][:u_k]):
+                            ggr_stats['grad/ggr_coef/%s' % CLASSES[cfg['dataset']][cidx]] = coef[i].item()
                     if args.ggr == 'csr':
                         # Eq. (8): clip only the coordinates opposing a stored anchor
                         clipped = (coef < 0)
@@ -620,7 +852,10 @@ def main():
                     'grad/ggr_subspace_k': float(u_k),
                 })
 
-                if U is not None and u_k > 1:
+                if U is not None and u_k > 1 and proto is not None and GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
+                    gram = U[:u_k] @ U[:u_k].t() - torch.eye(u_k, device=U.device, dtype=U.dtype)
+                    ggr_stats['grad/ggr_orth_err'] = gram.abs().max().item()
+                if U is not None and u_k > 1 and proto is None:
                     if args.ggr_reorth_every and iters % args.ggr_reorth_every == 0:
                         for a in range(u_k):  # modified Gram-Schmidt, in place
                             for b in range(a):
@@ -720,7 +955,11 @@ def main():
             'best_epoch_ema': best_epoch_ema,
             'grad_cos_conflict_steps': grad_cos_conflict_steps,
             'grad_cos_total_steps': grad_cos_total_steps,
-            'seed': args.seed
+            'seed': args.seed,
+            'unlabeled_seed': unlabeled_seed,
+            'init_seed': args.seed if args.init_seed is None else args.init_seed,
+            'ggr_proto': proto.cpu() if proto is not None else None,
+            'ggr_proto_updates': proto_updates.cpu() if proto is not None else None
         }
         torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
         if is_best:
