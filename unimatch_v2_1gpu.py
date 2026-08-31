@@ -82,6 +82,10 @@ parser.add_argument('--ggr-scope', type=str, default='all', choices=['backbone',
 parser.add_argument('--ggr-reorth-every', type=int, default=0,
                     help='re-orthonormalise U every N steps (0 = off; the Gram-Schmidt append already '
                          're-projects, so drift is normally negligible) [env: GGR_REORTH_EVERY]')
+parser.add_argument('--log-class-cos', action='store_true',
+                    help='log the pairwise cosines of the per-class supervised DPT-head '
+                         'gradients every optimizer step, saved per epoch as '
+                         'class_cos_ep*.npz. Independent of --ggr [env: LOG_CLASS_COS]')
 parser.add_argument('--seed', type=int, default=0,
                     help='seed for model init, data order and augmentations. Each epoch is reseeded '
                          'from (seed, epoch), so a resume reproduces the original run [env: SEED]')
@@ -96,9 +100,11 @@ parser.add_argument('--init-seed', type=int, default=None,
                          'Default: same as --seed. --seed A --init-seed B gives run B\'s head weights '
                          'with run A\'s data streams [env: INIT_SEED]')
 parser.add_argument('--deterministic', action='store_true',
-                    help='trade throughput for reproducibility: disable cudnn.benchmark and request '
-                         'deterministic kernels. Some ops (bilinear interpolate backward) have no '
-                         'deterministic CUDA implementation and only warn [env: DETERMINISTIC]')
+                    help='trade throughput (~4.5x slower) for reproducibility: disable cudnn.benchmark '
+                         'and request deterministic kernels, warn-only. Tightens same-seed runs but is '
+                         'not bitwise in either precision; under --bf16 it barely helps, since Flash '
+                         "Attention's backward needs strict mode (which nll_loss2d then aborts) "
+                         '[env: DETERMINISTIC]')
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
@@ -135,6 +141,7 @@ def labeled_pixel_freq(cfg, id_path, save_path, logger):
     logger.info('labeled pixel frequencies (%s): %s' % (id_path, ' '.join(
         '%s=%.4f' % (c, fr) for c, fr in zip(CLASSES[cfg['dataset']], freq))))
     return freq
+
 def boolean(raw):
     lowered = raw.strip().lower()
     if lowered in ('1', 'true', 'yes', 'on'):
@@ -142,6 +149,19 @@ def boolean(raw):
     if lowered in ('0', 'false', 'no', 'off'):
         return False
     raise ValueError
+
+def pairwise_cos(rows, idx, n_cls):
+    """(n_cls, n_cls) fp32 matrix of pairwise cosines between the per-class gradient
+    `rows`, scattered to the class ids in `idx`. Classes without a row stay NaN."""
+
+    out = np.full((n_cls, n_cls), np.nan, dtype=np.float32)
+    if rows is None or rows.shape[0] == 0:
+        return out
+    r = rows / rows.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    i = idx.cpu().numpy()
+    out[np.ix_(i, i)] = (r @ r.t()).float().cpu().numpy()
+    return out
+
 
 
 # When set, these win over the command line, matching how USE_WANDB overrides
@@ -162,6 +182,7 @@ ENV_OVERRIDES = (
     ('UNLABELED_SEED', 'unlabeled_seed', int, None),
     ('INIT_SEED', 'init_seed', int, None),
     ('DETERMINISTIC', 'deterministic', boolean, None),
+    ('LOG_CLASS_COS', 'log_class_cos', boolean, None),
 )
 
 
@@ -196,8 +217,29 @@ def setup_determinism(args, logger):
     cudnn.benchmark = not args.deterministic
     cudnn.deterministic = args.deterministic
     if args.deterministic:
-        # warn_only: bilinear interpolate backward (used on every forward here) has
-        # no deterministic CUDA kernel, so strict mode would abort the run
+        # warn_only: nll_loss2d forward (criterion_l, and the per-class F.cross_entropy)
+        # has no deterministic CUDA kernel, so strict mode aborts the run. This flag
+        # tightens same-seed runs a long way but is not bitwise in either precision.
+        # Measured torch 2.10+cu130 / RTX 4090, Aug 2026, same seed, max over 20-25 steps:
+        #   bf16: loss_x to ~2e-3 rel, grad_norm_x to ~0.1-0.17 rel, grad_cos_x_s to
+        #     ~0.07-0.18 ABSOLUTE (the cosine sits near 0, so relative is meaningless;
+        #     one step of 20 flipped across the -0.05 conflict threshold). Same order
+        #     with or without this flag: SDPA dispatches to Flash Attention, whose
+        #     backward is deterministic only under warn_only=False, so the flag leaves
+        #     the dominant bf16 source in.
+        #   fp32: ~35-100x tighter -- loss_x to ~5e-5 rel, grad_norm_x to ~2e-3 rel,
+        #     cos to ~1.5e-3 abs (default mode); ~2.6e-6 at step 0 under this flag. SDPA
+        #     takes the cutlass mem-eff kernel, which IS deterministic; the residual was
+        #     not isolated to a single op (CE, conv, Linear, interpolate all test
+        #     deterministic individually under this flag).
+        # So a same-seed fp32 pair spans a much smaller perturbation than a bf16 one --
+        # do not read fp32 replicates as a strong perturbation test. Cost ~2.9x
+        # (env_variables.md, 40 steps; a 20-step smoke reads 4.5x because benchmark
+        # autotuning is unamortised).
+        # (An older comment here blamed bilinear interpolate backward -- dpt.py:165/170,
+        # blocks.py:144. It is a real source in DEFAULT mode, ~4.7e-4 in fp32, but on
+        # 2.10 it has a deterministic kernel that this flag selects, so it is not the
+        # reason for warn_only and strict mode does not abort on it.)
         torch.use_deterministic_algorithms(True, warn_only=True)
     logger.info('seed=%d deterministic=%s cudnn.benchmark=%s\n' % (
         args.seed, args.deterministic, cudnn.benchmark))
@@ -467,21 +509,34 @@ def main():
     # micro-batches of the current step; proto_updates counts EMA updates per class so
     # each class runs the teacher's warm-up schedule from its own first appearance.
     proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, head_params = (None,) * 7
+    # per-class prototypes are needed either as GGR anchors or purely as a diagnostic;
+    # class_anchor is what the GGR block below keys on, so the log-only flag can never
+    # redirect vlr/osr/csr away from their recent anchors
+    class_anchor = args.ggr != 'none' and args.ggr_anchor == 'class'
     if args.sup_only:
         logger.info('supervised-only: unsupervised branch skipped; loss_s, mask_ratio and the '
                     'grad/*_s diagnostics are a zero stub\n')
+    if class_anchor or args.log_class_cos:
+        # Per-class supervised gradients live in DPT-head space regardless of the GGR
+        # surgery scope; --ggr-anchor class enforces --ggr-scope head, so under it the
+        # head slice and the scope slice are the same [lo, hi).
+        n_cls = cfg['nclass']
+        D_head = D_total - D_backbone
+        if D_head == 0:
+            raise ValueError("trainable head parameters are required for per-class gradients")
+        head_params = params[n_backbone:]
+        proto = torch.zeros(n_cls, D_head, device=flat_x.device, dtype=flat_x.dtype)
+        proto_acc = torch.zeros_like(proto)
+        proto_cnt = torch.zeros(n_cls, device=flat_x.device)
+        proto_updates = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
+        logger.info('per-class head gradients: %d classes x D=%.2fM (%.2f GiB)\n' % (
+            n_cls, D_head / 1e6, 2 * proto.numel() * proto.element_size() / 2 ** 30))
     if args.ggr != 'none':
         if D_scope == 0:
             raise ValueError('--ggr %s --ggr-scope %s selects no trainable parameters '
                              '(lock_backbone?)' % (args.ggr, args.ggr_scope))
         logger.info('GGR: mode=%s scope=%s D=%.2fM' % (args.ggr, args.ggr_scope, D_scope / 1e6))
-        if args.ggr_anchor == 'class':
-            n_cls = cfg['nclass']
-            head_params = params[scope_p_lo:scope_p_hi]
-            proto = torch.zeros(n_cls, D_scope, device=flat_x.device, dtype=flat_x.dtype)
-            proto_acc = torch.zeros_like(proto)
-            proto_cnt = torch.zeros(n_cls, device=flat_x.device)
-            proto_updates = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
+        if class_anchor:
             freq = labeled_pixel_freq(cfg, args.labeled_id_path, args.save_path, logger)
             inv = np.where(freq > 0, 1.0 / np.maximum(freq, 1e-12), 0.0)
             proto_w = torch.tensor(inv / inv.sum(), device=flat_x.device, dtype=flat_x.dtype)
@@ -508,6 +563,19 @@ def main():
         proto.copy_(resume_proto[0].to(proto.device))
         proto_updates.copy_(resume_proto[1].to(proto_updates.device))
         logger.info('GGR: restored class prototypes for %d classes from the checkpoint\n' % int((proto_updates > 0).sum()))
+
+    cos_iters, cos_inst_log, cos_ema_log = [], [], []
+
+    def save_class_cos(ep):
+        if not cos_iters:
+            return
+        path = os.path.join(args.save_path, 'class_cos_ep%03d.npz' % ep)
+        np.savez_compressed(path, iters=np.array(cos_iters),
+                            cos_inst=np.stack(cos_inst_log), cos_ema=np.stack(cos_ema_log),
+                            classes=np.array(CLASSES[cfg['dataset']]))
+        wandb.save(path, base_path=args.save_path)
+        logger.info('saved %d class-cosine matrices to %s' % (len(cos_iters), path))
+        cos_iters.clear(), cos_inst_log.clear(), cos_ema_log.clear()
 
     # the loop bound is capped but total_steps above is not, so a limited run walks
     # the first epoch_lim epochs of the full schedule instead of a compressed one
@@ -595,6 +663,7 @@ def main():
                     # (the graph is kept for the full-loss backward below). Plain CE regardless
                     # of criterion_l so the prototypes mean the same thing under OHEM.
                     ce_px = F.cross_entropy(pred_x, mask_x, ignore_index=255, reduction='none')
+                    g_c = None
                     for c in mask_x.unique().tolist():
                         if c == 255 or c >= proto.shape[0]:
                             continue
@@ -690,6 +759,29 @@ def main():
 
             iters = epoch * steps_per_epoch + step
 
+            seen, n_seen = None, 0
+            if proto is not None:
+                upd = proto_cnt > 0
+                obs, obs_cls = None, None
+                if upd.any():
+                    obs_cls = upd.nonzero(as_tuple=True)[0]
+                    obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
+                    r = (1.0 - 1.0 / (proto_updates[upd].to(proto.dtype) + 1.0)).clamp(max=0.996).unsqueeze(1)
+                    proto[upd] = r * proto[upd] + (1.0 - r) * obs
+                    proto_updates[upd] += 1
+                seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
+                n_seen = int(seen.sum())
+                if args.log_class_cos:
+                    # instantaneous: only the classes in this step's labeled crops have a
+                    # row; EMA: every class seen so far. Absent classes stay NaN.
+                    cos_inst_log.append(pairwise_cos(obs, obs_cls, cfg['nclass']))
+                    cos_ema_log.append(pairwise_cos(proto[seen], seen.nonzero(as_tuple=True)[0],
+                                                    cfg['nclass']))
+                    cos_iters.append(iters)
+                proto_acc.zero_()
+                proto_cnt.zero_()
+                del obs
+
             # ------------------------------ GGR ------------------------------
             # Chen et al., "Geometric Gradient Rectification for Safe Open-Set SSL".
             # The supervised gradient is the anchor and is never modified; only the
@@ -705,22 +797,8 @@ def main():
                 delta_norm = 0.0
                 g_w = None
 
-                if proto is not None:
-                    # 1. average each class over the micro-batches it appeared in, then EMA it
-                    #    with the teacher's schedule, run per class from its first appearance
-                    #    (r = 0 on the first update, so a new class starts at its observation)
-                    upd = proto_cnt > 0
-                    if upd.any():
-                        obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
-                        r = (1.0 - 1.0 / (proto_updates[upd].to(proto.dtype) + 1.0)).clamp(max=0.996).unsqueeze(1)
-                        proto[upd] = r * proto[upd] + (1.0 - r) * obs
-                        proto_updates[upd] += 1
-                        proto_acc.zero_()
-                        proto_cnt.zero_()
-                        del obs
-                    seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
-                    n_seen = int(seen.sum())
-                    # 2. anchors. vlr: the 1/f-weighted combination of the prototypes (weights
+                if class_anchor:
+                    # anchors. vlr: the 1/f-weighted combination of the prototypes (weights
                     #    renormalised over the classes seen so far). osr/csr: an orthonormal basis
                     #    of the prototypes, Gram-Schmidt order rarest class first, signs fixed so
                     #    each row points along its class's residual direction (csr clips against it).
@@ -750,7 +828,7 @@ def main():
                         ggr_stats['grad/ggr_cos_gw_gx'] = torch.dot(g_w, g_x_scope).item() / max(norm_w * scope_norm_x_sq ** 0.5, 1e-12)
                         ggr_stats['grad/ggr_cos_u_gw_before'] = torch.dot(g_w, g_u_scope).item() / max(norm_w * scope_norm_s_sq ** 0.5, 1e-12)
 
-                if args.ggr in ('osr', 'csr') and proto is None:
+                if args.ggr in ('osr', 'csr') and not class_anchor:
                     # UpdateSubspace (Alg. 1 lines 14-19): keep only the part of the
                     # current anchor that span(U) does not already contain, normalise
                     # it, and write it over the oldest basis vector.
@@ -795,7 +873,7 @@ def main():
                         ggr_stats['grad/ggr_fired'] = 0.0
                     ggr_stats['grad/ggr_cos_u_gw_after'] = torch.dot(g_w, g_u_scope).item() / max(
                         norm_w_sq ** 0.5 * g_u_scope.norm().item(), 1e-12)
-                elif args.ggr == 'vlr' and proto is not None:
+                elif args.ggr == 'vlr' and class_anchor:
                     ggr_stats['grad/ggr_fired'] = 0.0  # no class seen yet: nothing to anchor on
                 elif args.ggr == 'vlr':
                     # Eq. (5): fires only on a conflict, and removes exactly the
@@ -809,7 +887,7 @@ def main():
                         ggr_stats['grad/ggr_fired'] = 0.0
                 elif u_k > 0:
                     coef = U[:u_k] @ g_u_scope  # coordinates of g_u in the basis
-                    if proto is not None:
+                    if class_anchor:
                         # row i of the class basis is the residual direction of the i-th rarest
                         # seen class; a negative coordinate is what csr clips
                         for i, cidx in enumerate([int(c) for c in proto_order.tolist() if seen[c]][:u_k]):
@@ -852,10 +930,10 @@ def main():
                     'grad/ggr_subspace_k': float(u_k),
                 })
 
-                if U is not None and u_k > 1 and proto is not None and GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
+                if U is not None and u_k > 1 and class_anchor and GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
                     gram = U[:u_k] @ U[:u_k].t() - torch.eye(u_k, device=U.device, dtype=U.dtype)
                     ggr_stats['grad/ggr_orth_err'] = gram.abs().max().item()
-                if U is not None and u_k > 1 and proto is None:
+                if U is not None and u_k > 1 and not class_anchor:
                     if args.ggr_reorth_every and iters % args.ggr_reorth_every == 0:
                         for a in range(u_k):  # modified Gram-Schmidt, in place
                             for b in range(a):
@@ -911,8 +989,11 @@ def main():
                     logger.info('Smoke test: {:.2f} s/step (avg over {} steps), total steps {}, projected {:.1f} h'.format(
                         sec_per_step, timed_steps, total_steps, sec_per_step * total_steps / 3600))
                 logger.info('Peak GPU memory: {:.1f} GB'.format(torch.cuda.max_memory_allocated() / 1e9))
+                save_class_cos(epoch)
                 wandb.finish()
                 return
+
+        save_class_cos(epoch)
 
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
