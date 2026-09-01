@@ -73,6 +73,11 @@ parser.add_argument('--ggr-cone-rescale', type=float, default=0.0,
                     help='cone only: rescale the rectified head gradient back toward ||g_u||, factor '
                          'min(this, ||g_u||/||P(g_u)||); 0 disables. The clamp is the apex guard -- '
                          'as P(g_u) -> 0 the unclamped factor diverges [env: GGR_CONE_RESCALE]')
+parser.add_argument('--proto-beta', type=float, default=0.9,
+                    help='Adam beta for the class-prototype first moment (bias-corrected; effective '
+                         'horizon 1/(1-beta) updates, so 0.9 -> 10, 0.99 -> 100, 0.996 -> 250 = the '
+                         'old teacher-schedule horizon). Applies to every --ggr-anchor class mode '
+                         '[env: BETA]')
 parser.add_argument('--ggr-anchor', type=str, default='recent', choices=['recent', 'class'],
                     help="what GGR rectifies against. 'recent': the current supervised gradient (vlr) or a "
                          "ring buffer of the last --ggr-dim supervised gradients (osr/csr). 'class': per-class "
@@ -221,6 +226,7 @@ def update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates, beta=0.9
 ENV_OVERRIDES = (
     ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr', 'cone')),
     ('GGR_CONE_RESCALE', 'ggr_cone_rescale', float, None),
+    ('BETA', 'proto_beta', float, None),
     ('GGR_ANCHOR', 'ggr_anchor', str, ('recent', 'class')),
     ('GGR_DIM', 'ggr_dim', int, None),
     ('GGR_SCOPE', 'ggr_scope', str, ('backbone', 'head', 'all')),
@@ -346,6 +352,8 @@ def main():
         raise ValueError('--ggr-cone-rescale must be >= 0 (got %g)' % args.ggr_cone_rescale)
     if args.ggr_cone_rescale and args.ggr != 'cone':
         raise ValueError('--ggr-cone-rescale only applies to --ggr cone (got --ggr %s)' % args.ggr)
+    if not 0.0 <= args.proto_beta < 1.0:
+        raise ValueError('--proto-beta must be in [0, 1) (got %g)' % args.proto_beta)
     # before setup_distributed: the first CUDA call happens in there, and
     # CUBLAS_WORKSPACE_CONFIG has to be in place before cuBLAS initialises
     setup_determinism(args, logger)
@@ -605,7 +613,8 @@ def main():
             proto_order = torch.tensor(np.argsort(np.where(freq > 0, freq, np.inf)), device=flat_x.device)
             if args.ggr in ('osr', 'csr'):
                 U = torch.zeros(n_cls, D_scope, device=flat_x.device, dtype=flat_x.dtype)
-            logger.info('GGR: class-prototype anchors, %d classes x D=%.2fM (%.2f GiB incl. basis); 1/f weights: %s' % (
+            logger.info('GGR: class-prototype anchors (Adam beta=%.4g, horizon ~%.0f), %d classes x D=%.2fM (%.2f GiB incl. basis); 1/f weights: %s' % (
+                args.proto_beta, 1.0 / max(1.0 - args.proto_beta, 1e-9),
                 n_cls, D_scope / 1e6, (2 + (U is not None)) * proto.numel() * proto.element_size() / 2 ** 30,
                 ' '.join('%s=%.3f' % (c, w) for c, w in zip(CLASSES[cfg['dataset']], proto_w.tolist()))))
         elif args.ggr in ('osr', 'csr'):
@@ -820,7 +829,8 @@ def main():
 
             seen, n_seen = None, 0
             if proto is not None:
-                obs, obs_cls = update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates)
+                obs, obs_cls = update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates,
+                                                       beta=args.proto_beta)
                 seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
                 n_seen = int(seen.sum())
                 if args.log_class_cos:
