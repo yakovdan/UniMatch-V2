@@ -52,6 +52,9 @@ parser.add_argument('--epoch-lim', '--epoch_lim', type=int, default=0,
                          "cfg['epochs'] (unlike --epochs, which compresses it). 0 = disabled [env: EPOCH_LIM]")
 parser.add_argument('--bf16', action='store_true', help='bf16 autocast for forwards/losses (recipe deviation: paper trains fp32)')
 parser.add_argument('--stop-after', type=int, default=None, help='debug: stop after N optimizer steps (smoke test)')
+parser.add_argument('--lr', type=float, default=None,
+                    help="override lr in the config: the backbone's base LR (config default 5e-6) and the "
+                         'peak of the poly schedule; the head trains at lr * lr_multi [env: LR]')
 parser.add_argument('--lr-multi', type=float, default=None,
                     help="override lr_multi in the config: the head's LR is lr * lr_multi (config default 40) "
                          '[env: LR_MULTI]')
@@ -234,6 +237,7 @@ ENV_OVERRIDES = (
     ('EPOCH_LIM', 'epoch_lim', int, None),
     ('SUP_ONLY', 'sup_only', boolean, None),
     ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
+    ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
     ('UNLABELED_SEED', 'unlabeled_seed', int, None),
@@ -337,6 +341,11 @@ def main():
     apply_env_overrides(args, logger)
     if args.lock_backbone:
         cfg['lock_backbone'] = True
+    if args.lr is not None:
+        cfg['lr'] = args.lr
+    args.lr = cfg['lr']  # so all_args / W&B record the effective value either way
+    if args.lr <= 0:
+        raise ValueError('--lr must be > 0 (got %g)' % args.lr)
     if args.lr_multi is not None:
         cfg['lr_multi'] = args.lr_multi
     args.lr_multi = cfg['lr_multi']  # so all_args / W&B record the effective value either way
