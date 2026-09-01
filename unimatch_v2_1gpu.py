@@ -20,6 +20,7 @@ from dataset.semi import SemiDataset
 from model.semseg.dpt import DPT
 from supervised import evaluate
 from util.classes import CLASSES
+from util.csr_cone import cone_rectify
 from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
@@ -63,14 +64,19 @@ parser.add_argument('--sup-only', action='store_true',
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
                          'LR schedule and EMA are unchanged, so a run is seed-paired with the semi-supervised '
                          'run on its supervised component; grad/* logs a zero unsupervised stub [env: SUP_ONLY]')
-parser.add_argument('--ggr', type=str, default='none', choices=['none', 'vlr', 'osr', 'csr'],
+parser.add_argument('--ggr', type=str, default='none', choices=['none', 'vlr', 'osr', 'csr', 'cone'],
                     help='rectify the unsupervised gradient against the supervised one (Chen et al., '
                          'Geometric Gradient Rectification): vector-level, orthogonal-subspace or '
-                         'conic-subspace [env: GGR_MODE]')
+                         "conic-subspace. 'cone': exact projection onto the non-conflict cone of the "
+                         'per-class prototypes, background excluded (class-anchor only) [env: GGR_MODE]')
+parser.add_argument('--ggr-cone-rescale', type=float, default=0.0,
+                    help='cone only: rescale the rectified head gradient back toward ||g_u||, factor '
+                         'min(this, ||g_u||/||P(g_u)||); 0 disables. The clamp is the apex guard -- '
+                         'as P(g_u) -> 0 the unclamped factor diverges [env: GGR_CONE_RESCALE]')
 parser.add_argument('--ggr-anchor', type=str, default='recent', choices=['recent', 'class'],
                     help="what GGR rectifies against. 'recent': the current supervised gradient (vlr) or a "
                          "ring buffer of the last --ggr-dim supervised gradients (osr/csr). 'class': per-class "
-                         'supervised gradients of the DPT head, EMA-averaged with the teacher schedule; osr/csr '
+                         'supervised gradients of the DPT head, Adam-style EMA (beta=0.9, bias-corrected); osr/csr '
                          'project onto their orthonormal basis (rarest class first), vlr against their '
                          '1/pixel-frequency weighted sum. Requires --ggr-scope head [env: GGR_ANCHOR]')
 parser.add_argument('--ggr-dim', type=int, default=10,
@@ -162,6 +168,50 @@ def pairwise_cos(rows, idx, n_cls):
     out[np.ix_(i, i)] = (r @ r.t()).float().cpu().numpy()
     return out
 
+def update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates, beta=0.9):
+    r"""Adam-style first-moment update of the per-class gradient prototypes, in place.
+
+    ``proto_acc`` / ``proto_cnt`` hold the current step's per-class gradient sums and
+    observation counts over the labeled micro-batches; classes with count 0 (absent
+    from every crop this step) are left untouched -- frozen, not decayed. Each
+    observed class contributes the mean over its micro-batches,
+    $\bar g_c = \mathrm{acc}_c / \mathrm{cnt}_c$, folded into the Adam first moment
+    $m_c \leftarrow \beta m_c + (1-\beta) \bar g_c$ with bias correction
+    $\hat m_c = m_c / (1 - \beta^{t_c})$, counting $t_c$ per class from its own
+    first appearance.
+
+    ``proto`` stores the *bias-corrected* estimate $\hat m_c$ directly, so every
+    consumer (anchors, cosines, checkpoints) reads a properly normalised prototype
+    with no correction of its own. That works because $\hat m$ obeys the exact
+    convex recursion
+
+        $\hat m_t = r_t \hat m_{t-1} + (1 - r_t) \bar g_t$,
+        $r_t = \beta (1 - \beta^{t-1}) / (1 - \beta^t)$,
+
+    with $r_1 = 0$ -- the first observation replaces the zero row and *is* the
+    bias-corrected estimate -- and $r_t \to \beta$, i.e. an effective horizon of
+    $1/(1-\beta)$ = 10 updates (much more responsive than the teacher's 250-step
+    schedule this replaces).
+
+    Mutates ``proto`` and ``proto_updates``. Does NOT reset the accumulators: the
+    caller zeroes ``proto_acc`` / ``proto_cnt`` after the diagnostics that reuse the
+    returned observations.
+
+    Returns:
+        ``(obs, obs_cls)`` -- the step observations ``(k, D)`` and their class ids
+        ``(k,)``, or ``(None, None)`` when no class was observed this step.
+    """
+    upd = proto_cnt > 0
+    if not upd.any():
+        return None, None
+    obs_cls = upd.nonzero(as_tuple=True)[0]
+    obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
+    t = proto_updates[upd].to(proto.dtype) + 1.0   # index of THIS update, t >= 1
+    r = (beta * (1.0 - beta ** (t - 1.0)) / (1.0 - beta ** t)).unsqueeze(1)
+    proto[upd] = r * proto[upd] + (1.0 - r) * obs
+    proto_updates[upd] += 1
+    return obs, obs_cls
+
 
 
 # When set, these win over the command line, matching how USE_WANDB overrides
@@ -169,7 +219,8 @@ def pairwise_cos(rows, idx, n_cls):
 # process (Vast's --onstart, which replaces the image entrypoint) can set these
 # instead. (env var, args attribute, type, allowed values or None)
 ENV_OVERRIDES = (
-    ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr')),
+    ('GGR_MODE', 'ggr', str, ('none', 'vlr', 'osr', 'csr', 'cone')),
+    ('GGR_CONE_RESCALE', 'ggr_cone_rescale', float, None),
     ('GGR_ANCHOR', 'ggr_anchor', str, ('recent', 'class')),
     ('GGR_DIM', 'ggr_dim', int, None),
     ('GGR_SCOPE', 'ggr_scope', str, ('backbone', 'head', 'all')),
@@ -288,6 +339,13 @@ def main():
     if args.ggr != 'none' and args.ggr_anchor == 'class' and args.ggr_scope != 'head':
         raise ValueError('--ggr-anchor class builds its anchors in DPT-head space; use --ggr-scope head '
                          '(got %s)' % args.ggr_scope)
+    if args.ggr == 'cone' and args.ggr_anchor != 'class':
+        raise ValueError('--ggr cone projects onto the per-class prototype cone; it requires '
+                         '--ggr-anchor class (got %s)' % args.ggr_anchor)
+    if args.ggr_cone_rescale < 0:
+        raise ValueError('--ggr-cone-rescale must be >= 0 (got %g)' % args.ggr_cone_rescale)
+    if args.ggr_cone_rescale and args.ggr != 'cone':
+        raise ValueError('--ggr-cone-rescale only applies to --ggr cone (got --ggr %s)' % args.ggr)
     # before setup_distributed: the first CUDA call happens in there, and
     # CUBLAS_WORKSPACE_CONFIG has to be in place before cuBLAS initialises
     setup_determinism(args, logger)
@@ -507,7 +565,8 @@ def main():
     # supervised gradient (CE averaged over the pixels of class c) w.r.t. the head
     # parameters, laid out like flat_x[D_backbone:]. proto_acc / proto_cnt gather the
     # micro-batches of the current step; proto_updates counts EMA updates per class so
-    # each class runs the teacher's warm-up schedule from its own first appearance.
+    # each class runs its Adam-style bias correction from its own first appearance
+    # (see update_class_prototypes: proto stores the bias-corrected first moment).
     proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, head_params = (None,) * 7
     # per-class prototypes are needed either as GGR anchors or purely as a diagnostic;
     # class_anchor is what the GGR block below keys on, so the log-only flag can never
@@ -761,14 +820,7 @@ def main():
 
             seen, n_seen = None, 0
             if proto is not None:
-                upd = proto_cnt > 0
-                obs, obs_cls = None, None
-                if upd.any():
-                    obs_cls = upd.nonzero(as_tuple=True)[0]
-                    obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
-                    r = (1.0 - 1.0 / (proto_updates[upd].to(proto.dtype) + 1.0)).clamp(max=0.996).unsqueeze(1)
-                    proto[upd] = r * proto[upd] + (1.0 - r) * obs
-                    proto_updates[upd] += 1
+                obs, obs_cls = update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates)
                 seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
                 n_seen = int(seen.sum())
                 if args.log_class_cos:
@@ -807,7 +859,7 @@ def main():
                             w = proto_w * seen
                             w = w / w.sum()
                             g_w = w @ proto
-                        else:
+                        elif args.ggr in ('osr', 'csr'):  # cone needs no basis
                             order = [int(c) for c in proto_order.tolist() if seen[c]]
                             Q, R = torch.linalg.qr(proto[order].t(), mode='reduced')  # (D, k)
                             diag = R.diagonal()
@@ -885,6 +937,52 @@ def main():
                         ggr_stats['grad/ggr_fired'] = 1.0
                     else:
                         ggr_stats['grad/ggr_fired'] = 0.0
+                elif args.ggr == 'cone':
+                    # exact projection of g_u onto the foreground cone
+                    # {g : <g, G_c> >= 0 for every seen foreground class}: the
+                    # minimal edit after which the pseudo-labels oppose no class
+                    # the labeled data has vouched for. Background (class 0) is
+                    # deliberately excluded -- it is the class the pseudo-labels
+                    # already favour, and including it makes the cone nearly
+                    # degenerate (GGR-class.md section 4.1). All math lives in
+                    # util/csr_cone.py; this branch only selects rows, copies
+                    # the result back and maps diagnostics to wandb keys.
+                    rows = seen.clone()
+                    rows[0] = False  # class 0 = background (util/classes.py)
+                    idx = rows.nonzero(as_tuple=True)[0]
+                    ggr_stats['grad/ggr_fired'] = 0.0
+                    if idx.numel() > 0:
+                        g_new, cone_diag = cone_rectify(proto[idx], g_u_scope)
+                        if cone_diag['fired']:
+                            g_u_scope.copy_(g_new)  # lands in flat_s; write-back below unchanged
+                            if args.ggr_cone_rescale > 0:
+                                # restore the step magnitude along the permitted directions:
+                                # ||P(g_u)|| = ||g_u|| sqrt(1 - edit_frac^2) (Moreau), so the
+                                # norm-matching factor is 1/sqrt(1 - ef^2); the clamp is the
+                                # apex guard (P -> 0 would otherwise blow the factor up).
+                                # Rescaling stays inside the cone (K is scale-invariant).
+                                ef = cone_diag['edit_frac']
+                                factor = min(args.ggr_cone_rescale,
+                                             max(1.0 - ef * ef, 1e-30) ** -0.5)
+                                g_u_scope.mul_(factor)
+                                ggr_stats['grad/ggr_cone_rescale_factor'] = factor
+                        delta_norm = cone_diag['delta_norm']
+                        ggr_stats.update({
+                            'grad/ggr_fired': cone_diag['fired'],
+                            'grad/ggr_cone_k': float(cone_diag['k']),
+                            'grad/ggr_cone_active': float(cone_diag['active']),
+                            'grad/ggr_cone_sweeps': float(cone_diag['sweeps']),
+                            'grad/ggr_cone_converged': float(cone_diag['converged']),
+                            'grad/ggr_cone_rho_feas': cone_diag['rho_feas'],
+                            'grad/ggr_cone_rho_comp': cone_diag['rho_comp'],
+                            'grad/ggr_cone_edit_frac': cone_diag['edit_frac'],
+                        })
+                        for i, ci in enumerate(idx.tolist()):
+                            cname = CLASSES[cfg['dataset']][ci]
+                            # lambda under grad/ggr_coef/* for parity with osr/csr
+                            ggr_stats['grad/ggr_coef/%s' % cname] = cone_diag['lam'][i]
+                            ggr_stats['grad/ggr_cone_q/%s' % cname] = cone_diag['q'][i]
+                            ggr_stats['grad/ggr_cone_s/%s' % cname] = cone_diag['s'][i]
                 elif u_k > 0:
                     coef = U[:u_k] @ g_u_scope  # coordinates of g_u in the basis
                     if class_anchor:
