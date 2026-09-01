@@ -342,9 +342,9 @@ def main():
     args.lr_multi = cfg['lr_multi']  # so all_args / W&B record the effective value either way
     if args.sup_only and args.ggr != 'none':
         raise ValueError('--sup-only has no unsupervised gradient to rectify; drop --ggr %s' % args.ggr)
-    if args.ggr != 'none' and args.ggr_anchor == 'class' and args.ggr_scope != 'head':
-        raise ValueError('--ggr-anchor class builds its anchors in DPT-head space; use --ggr-scope head '
-                         '(got %s)' % args.ggr_scope)
+    if args.ggr != 'none' and args.ggr_anchor == 'class' and args.ggr_scope not in ('head', 'all'):
+        raise ValueError('--ggr-anchor class builds its anchors in the surgery-scope space; use '
+                         '--ggr-scope head or all (got %s)' % args.ggr_scope)
     if args.ggr == 'cone' and args.ggr_anchor != 'class':
         raise ValueError('--ggr cone projects onto the per-class prototype cone; it requires '
                          '--ggr-anchor class (got %s)' % args.ggr_anchor)
@@ -575,7 +575,7 @@ def main():
     # micro-batches of the current step; proto_updates counts EMA updates per class so
     # each class runs its Adam-style bias correction from its own first appearance
     # (see update_class_prototypes: proto stores the bias-corrected first moment).
-    proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, head_params = (None,) * 7
+    proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, anchor_params = (None,) * 7
     # per-class prototypes are needed either as GGR anchors or purely as a diagnostic;
     # class_anchor is what the GGR block below keys on, so the log-only flag can never
     # redirect vlr/osr/csr away from their recent anchors
@@ -584,20 +584,27 @@ def main():
         logger.info('supervised-only: unsupervised branch skipped; loss_s, mask_ratio and the '
                     'grad/*_s diagnostics are a zero stub\n')
     if class_anchor or args.log_class_cos:
-        # Per-class supervised gradients live in DPT-head space regardless of the GGR
-        # surgery scope; --ggr-anchor class enforces --ggr-scope head, so under it the
-        # head slice and the scope slice are the same [lo, hi).
+        # Per-class supervised gradients live in the surgery-scope space: under
+        # --ggr-scope head (the protocol default) that is the DPT head, laid out like
+        # flat_x[D_backbone:]; under --ggr-scope all the anchors span the whole model,
+        # laid out like flat_x. Log-only use (no GGR) stays in head space so the
+        # class-cos artifacts keep their historical meaning. Whole-model anchors cost
+        # 3-8 FULL backwards per micro-batch (the head-only ones stop at the head)
+        # and ~3x the prototype memory on dinov2_small.
         n_cls = cfg['nclass']
-        D_head = D_total - D_backbone
-        if D_head == 0:
-            raise ValueError("trainable head parameters are required for per-class gradients")
-        head_params = params[n_backbone:]
-        proto = torch.zeros(n_cls, D_head, device=flat_x.device, dtype=flat_x.dtype)
+        if class_anchor and args.ggr_scope == 'all':
+            D_anchor, anchor_params = D_total, params
+        else:
+            D_anchor, anchor_params = D_total - D_backbone, params[n_backbone:]
+        if D_anchor == 0:
+            raise ValueError("trainable parameters are required for per-class gradients")
+        proto = torch.zeros(n_cls, D_anchor, device=flat_x.device, dtype=flat_x.dtype)
         proto_acc = torch.zeros_like(proto)
         proto_cnt = torch.zeros(n_cls, device=flat_x.device)
         proto_updates = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
-        logger.info('per-class head gradients: %d classes x D=%.2fM (%.2f GiB)\n' % (
-            n_cls, D_head / 1e6, 2 * proto.numel() * proto.element_size() / 2 ** 30))
+        logger.info('per-class anchor gradients (scope=%s): %d classes x D=%.2fM (%.2f GiB)\n' % (
+            args.ggr_scope if class_anchor else 'head',
+            n_cls, D_anchor / 1e6, 2 * proto.numel() * proto.element_size() / 2 ** 30))
     if args.ggr != 'none':
         if D_scope == 0:
             raise ValueError('--ggr %s --ggr-scope %s selects no trainable parameters '
@@ -735,10 +742,10 @@ def main():
                     for c in mask_x.unique().tolist():
                         if c == 255 or c >= proto.shape[0]:
                             continue
-                        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), head_params,
+                        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), anchor_params,
                                                   retain_graph=True, allow_unused=True)
                         row, off = proto_acc[c], 0
-                        for p, g in zip(head_params, g_c):
+                        for p, g in zip(anchor_params, g_c):
                             n = p.numel()
                             if g is not None:
                                 row[off:off + n].add_(g.reshape(-1))
