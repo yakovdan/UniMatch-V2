@@ -371,6 +371,67 @@ def load_micro_batch(loader, model_ema, sup_only, bf16):
                       ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt)
 
 
+def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16):
+    """The unsupervised half of one micro-batch: the student's forward on the two
+    strong views, the confidence-masked consistency loss against the teacher's
+    pseudo-label, and its backward. The loss, scaled by 1/(2*accum) like the
+    supervised one, backwards into every parameter's .grad on top of the supervised
+    gradient the caller has already accumulated there, so at step end
+    grad_s_acc = .grad - grad_x_acc is the unsupervised gradient.
+
+    Both strong views go through one forward with Complementary Dropout, which
+    draws torch's CPU RNG (Binomial sample + randperm, model/semseg/dpt.py) -- the
+    step's only main-process draw, owned by the unlabeled seed. The teacher
+    predicted on the *unmixed* weak view, so the pseudo-label, its confidence and
+    the ignore mask are CutMixed here with the same boxes as the images (see
+    cutmix_). Per view, the per-pixel CE is kept only where the teacher's
+    confidence reaches conf_thresh and the pixel is not padding, then divided by
+    the count of ALL non-padding pixels: unconfident pixels contribute zero but
+    still count, so the loss scales with the confident fraction.
+
+    Under --sup-only nothing runs: the loss is a zero scalar with no graph, so
+    nothing else backwards into .grad and the unsupervised stub every grad/* metric
+    sees is exactly zero. The caller keeps the (loss_x + loss_u_s) / 2 form so
+    train/loss_all and the applied gradient scale match the semi-supervised runs.
+
+    Returns:
+        ``(loss_u_s, mask_ratio)`` -- the unscaled unsupervised loss (0-dim tensor)
+        and the fraction of non-padding pixels of the unmixed weak view whose
+        teacher confidence reaches conf_thresh (float; diagnostic only, it feeds
+        train/mask_ratio and nothing else).
+    """
+    if sup_only:
+        return torch.zeros((), device=mb.img_x.device), 0.0
+
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+        pred_u_s1, pred_u_s2 = model(torch.cat((mb.img_u_s1, mb.img_u_s2)), comp_drop=True).chunk(2)
+
+    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
+    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
+
+    mask_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box1 == 1]
+    conf_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box1 == 1]
+    ignore_mask_cutmixed1[mb.cutmix_box1 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box1 == 1]
+
+    mask_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box2 == 1]
+    conf_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box2 == 1]
+    ignore_mask_cutmixed2[mb.cutmix_box2 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box2 == 1]
+
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+        loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
+        loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= conf_thresh) & (ignore_mask_cutmixed1 != 255))
+        loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
+
+        loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
+        loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= conf_thresh) & (ignore_mask_cutmixed2 != 255))
+        loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+
+        loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
+    (loss_u_s / (2.0 * accum)).backward()
+    mask_ratio = ((mb.conf_u_w >= conf_thresh) & (mb.ignore_mask != 255)).sum().item() / (mb.ignore_mask != 255).sum().item()
+    return loss_u_s, mask_ratio
+
+
 def main():
     args = parser.parse_args()
 
@@ -802,40 +863,10 @@ def main():
                     p.grad = g.contiguous() if p.grad is None else p.grad.add_(g)
                 del grads
 
-                if args.sup_only:
-                    # nothing else backwards into .grad, so at step end grad_s_acc = .grad - grad_x_acc
-                    # is exactly zero: the unsupervised stub every grad/* metric sees. The loss keeps
-                    # its (loss_x + loss_u_s) / 2 form so train/loss_all and the applied gradient
-                    # scale match the semi-supervised runs.
-                    loss_u_s = torch.zeros((), device=img_x.device)
-                    mask_ratio = 0.0
-                else:
-                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                        pred_u_s1, pred_u_s2 = model(torch.cat((mb.img_u_s1, mb.img_u_s2)), comp_drop=True).chunk(2)
-
-                    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
-                    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
-
-                    mask_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box1 == 1]
-                    conf_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box1 == 1]
-                    ignore_mask_cutmixed1[mb.cutmix_box1 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box1 == 1]
-
-                    mask_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box2 == 1]
-                    conf_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box2 == 1]
-                    ignore_mask_cutmixed2[mb.cutmix_box2 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box2 == 1]
-
-                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                        loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-                        loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
-                        loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
-
-                        loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-                        loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
-                        loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
-
-                        loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
-                    (loss_u_s / (2.0 * accum)).backward()
-                    mask_ratio = ((mb.conf_u_w >= cfg['conf_thresh']) & (mb.ignore_mask != 255)).sum().item() / (mb.ignore_mask != 255).sum().item()
+                # the unsupervised half backwards into the same .grad, on top of the
+                # supervised gradient just accumulated there (zero stub under --sup-only)
+                loss_u_s, mask_ratio = unsup_forward_backward(
+                    model, mb, criterion_u, cfg['conf_thresh'], accum, args.sup_only, args.bf16)
 
                 loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
 
