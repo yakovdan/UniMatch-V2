@@ -465,6 +465,63 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
     return loss_u_s, mask_ratio
 
 
+class MicroBatchLosses(NamedTuple):
+    """What train_micro_batch reports back, as Python floats."""
+    loss: float        # (loss_x + loss_s) / 2, the quantity the applied gradient descends
+    loss_x: float      # supervised loss, unscaled
+    loss_s: float      # unsupervised loss, unscaled (0 under --sup-only)
+    mask_ratio: float  # confident fraction of the weak view's non-padding pixels (0 under --sup-only)
+
+
+def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
+                      accum, conf_thresh, sup_only, bf16,
+                      anchor_params=None, proto_acc=None, proto_cnt=None):
+    """One micro-batch of an optimizer step: load and prepare it (load_micro_batch),
+    the labeled forward and loss, the per-class anchor gradients when prototypes are
+    tracked, the supervised backward, then the unsupervised half
+    (unsup_forward_backward).
+
+    The labeled and unlabeled losses live in separate graphs, so each part backwards
+    right after its own forward, which halves peak memory. The labeled part uses
+    autograd.grad plus a manual accumulation into .grad (numerically identical to
+    .backward()) so that ``grad_x_acc`` tracks the supervised gradient on its own,
+    separately from the unsupervised one that then backwards into the same .grad
+    buffers. Both parts are scaled by 1/(2*accum): over the step's ``accum`` calls
+    the applied gradient becomes the mean micro-batch gradient of (loss_x + loss_s)/2.
+    A parameter the labeled loss does not reach (allow_unused) keeps its .grad
+    untouched -- still None on the first call.
+
+    Per-class gradients are accumulated iff ``proto_acc`` is given (--ggr-anchor
+    class or --log-class-cos); ``anchor_params`` and ``proto_cnt`` go with it.
+
+    Returns the micro-batch's losses (MicroBatchLosses). The gradients are left in
+    .grad and ``grad_x_acc``; the prototype accumulators are updated in place.
+    """
+    mb = load_micro_batch(loader, model_ema, sup_only, bf16)
+
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+        pred_x = model(mb.img_x)
+        loss_x = criterion_l(pred_x, mb.mask_x)
+    if proto_acc is not None:
+        # one anchor-scope backward per class present in the crop; the graph is kept
+        # for the full-loss backward below
+        accumulate_class_grads(pred_x, mb.mask_x, anchor_params, proto_acc, proto_cnt)
+    grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
+    for p, g_x, g in zip(params, grad_x_acc, grads):
+        if g is None:
+            continue
+        g_x += g
+        p.grad = g.contiguous() if p.grad is None else p.grad.add_(g)
+    del grads  # before the strong-view forward: these are a full model gradient
+
+    # the unsupervised half backwards into the same .grad, on top of the supervised
+    # gradient just accumulated there (zero stub under --sup-only)
+    loss_u_s, mask_ratio = unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16)
+
+    loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
+    return MicroBatchLosses(loss.item(), loss_x.item(), loss_u_s.item(), mask_ratio)
+
+
 def main():
     args = parser.parse_args()
 
@@ -856,45 +913,21 @@ def main():
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
             for _ in range(accum):
-                mb = load_micro_batch(loader, model_ema, args.sup_only, args.bf16)
-                img_x, mask_x = mb.img_x, mb.mask_x
+                # forwards and backwards of one micro-batch; gradients land in .grad
+                # and grad_x_acc, the per-class accumulators (if any) are updated
+                r = train_micro_batch(
+                    loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
+                    accum, cfg['conf_thresh'], args.sup_only, args.bf16,
+                    anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt)
 
-                # labeled and unlabeled losses live in separate graphs, so
-                # backward each part right after its forward to halve peak memory.
-                # The labeled part uses autograd.grad + manual accumulation into
-                # .grad (numerically identical to .backward()) so grad_x_acc can
-                # track the supervised gradient separately from the unsupervised
-                # one that later backwards into the same .grad buffers.
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                    pred_x = model(img_x)
-                    loss_x = criterion_l(pred_x, mask_x)
-                if proto is not None:
-                    # one anchor-scope backward per class present in the crop; the graph
-                    # is kept for the full-loss backward below
-                    accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt)
-                grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
-                for p, g_x, g in zip(params, grad_x_acc, grads):
-                    if g is None:
-                        continue
-                    g_x += g
-                    p.grad = g.contiguous() if p.grad is None else p.grad.add_(g)
-                del grads
+                group_loss += r.loss / accum
+                group_loss_x += r.loss_x / accum
+                group_loss_s += r.loss_s / accum
 
-                # the unsupervised half backwards into the same .grad, on top of the
-                # supervised gradient just accumulated there (zero stub under --sup-only)
-                loss_u_s, mask_ratio = unsup_forward_backward(
-                    model, mb, criterion_u, cfg['conf_thresh'], accum, args.sup_only, args.bf16)
-
-                loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
-
-                group_loss += loss.item() / accum
-                group_loss_x += loss_x.item() / accum
-                group_loss_s += loss_u_s.item() / accum
-
-                total_loss.update(loss.item())
-                total_loss_x.update(loss_x.item())
-                total_loss_s.update(loss_u_s.item())
-                total_mask_ratio.update(mask_ratio)
+                total_loss.update(r.loss)
+                total_loss_x.update(r.loss_x)
+                total_loss_s.update(r.loss_s)
+                total_mask_ratio.update(r.mask_ratio)
 
             # norms/cosine of the supervised vs unsupervised parts of this step's
             # gradient, as applied (i.e. including the 1/(2*accum) loss scaling).
