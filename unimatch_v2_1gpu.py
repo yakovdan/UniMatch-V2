@@ -21,7 +21,7 @@ from dataset.semi import SemiDataset
 from model.semseg.dpt import DPT
 from supervised import evaluate
 from util.classes import CLASSES
-from util.csr_cone import cone_rectify
+from util.ggr import rectify as ggr_rectify
 from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
@@ -125,10 +125,8 @@ parser.add_argument('--port', default=None, type=int)
 
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
-GGR_MIN_RESIDUAL = 1e-8   # below this the current anchor adds no direction the basis lacks
-GGR_ORTH_LOG_EVERY = 200  # how often to log max|U^T U - I| as a basis-health check
-GGR_PROJ_LOG_EVERY = 1
 GGR_CLASS_MIN_NORM = 1e-12  # a class prototype below this has no direction to contribute
+# the per-step rectification and its own constants live in util/ggr.py
 
 
 def labeled_pixel_freq(cfg, id_path, save_path, logger):
@@ -896,211 +894,22 @@ def main():
                 del obs
 
             # ------------------------------ GGR ------------------------------
-            # Chen et al., "Geometric Gradient Rectification for Safe Open-Set SSL".
-            # The supervised gradient is the anchor and is never modified; only the
-            # unsupervised part is projected, and the two are then re-summed into
-            # .grad. This runs after the raw-conflict diagnostics above and before
-            # optimizer.step(), so grad/grad_cos_x_s keeps its meaning as the
-            # *pre*-rectification conflict metric (paper section C.1) while
-            # grad/ggr_cos_after is the post-rectification (applied) one.
-            ggr_stats = {}
-            if args.ggr != 'none':
-                g_x_scope = flat_x[scope_lo:scope_hi]  # the paper's g_s, the anchor
-                g_u_scope = flat_s[scope_lo:scope_hi]  # the paper's g_u, the auxiliary
-                delta_norm = 0.0
-                g_w = None
-
-                if class_anchor:
-                    # anchors. vlr: the 1/f-weighted combination of the prototypes (weights
-                    #    renormalised over the classes seen so far). osr/csr: an orthonormal basis
-                    #    of the prototypes, Gram-Schmidt order rarest class first, signs fixed so
-                    #    each row points along its class's residual direction (csr clips against it).
-                    if n_seen > 0:
-                        if args.ggr == 'vlr':
-                            w = proto_w * seen
-                            w = w / w.sum()
-                            g_w = w @ proto
-                        elif args.ggr in ('osr', 'csr'):  # cone needs no basis
-                            order = [int(c) for c in proto_order.tolist() if seen[c]]
-                            Q, R = torch.linalg.qr(proto[order].t(), mode='reduced')  # (D, k)
-                            diag = R.diagonal()
-                            keep = diag.abs() > GGR_MIN_RESIDUAL
-                            Q = Q[:, keep] * diag[keep].sign()
-                            u_k = int(keep.sum())
-                            U[:u_k] = Q.t()
-                            del Q, R
-                    cos_u_proto = (proto @ g_u_scope) / (proto.norm(dim=1) * g_u_scope.norm()).clamp_min(1e-12)
-                    ggr_stats['grad/ggr_proto_classes'] = float(n_seen)
-                    for ci, cname in enumerate(CLASSES[cfg['dataset']]):
-                        if seen[ci]:
-                            ggr_stats['grad/proto_norm/%s' % cname] = proto[ci].norm().item()
-                            ggr_stats['grad/ggr_cos_u_proto/%s' % cname] = cos_u_proto[ci].item()
-                    if g_w is not None:
-                        norm_w = g_w.norm().item()
-                        ggr_stats['grad/ggr_gw_norm'] = norm_w
-                        ggr_stats['grad/ggr_cos_gw_gx'] = torch.dot(g_w, g_x_scope).item() / max(norm_w * scope_norm_x_sq ** 0.5, 1e-12)
-                        ggr_stats['grad/ggr_cos_u_gw_before'] = torch.dot(g_w, g_u_scope).item() / max(norm_w * scope_norm_s_sq ** 0.5, 1e-12)
-
-                if args.ggr in ('osr', 'csr') and not class_anchor:
-                    # UpdateSubspace (Alg. 1 lines 14-19): keep only the part of the
-                    # current anchor that span(U) does not already contain, normalise
-                    # it, and write it over the oldest basis vector.
-                    v = ggr_scratch.copy_(g_x_scope)
-                    coef_x = None
-                    for _ in range(2):  # project twice: fp32 Gram-Schmidt loses orthogonality once
-                        if u_k > 0:
-                            c = U[:u_k] @ v
-                            if coef_x is None:
-                                coef_x = c
-                            else:
-                                coef_x += c
-                            v -= c @ U[:u_k]
-                    if coef_x is not None and GGR_PROJ_LOG_EVERY and iters % GGR_PROJ_LOG_EVERY == 0:
-                        # rows are orthonormal, so ||coef_x|| == ||P_U g_x|| and
-                        # |coef_x[i]| / ||g_x|| == |cos(u_i, g_x)|; the per-row values sum
-                        # in squares to the total. Sorted by row age, youngest first.
-                        norm_x = max(scope_norm_x_sq ** 0.5, 1e-12)
-                        per_row = (coef_x.abs() / norm_x).tolist()
-                        by_age = sorted((iters - u_iters[i], per_row[i]) for i in range(u_k))
-                        logger.info('GGR proj: |P_U g_x| / |g_x| = %.4f over k=%d rows; '
-                                    '|cos(u_i, g_x)| by row age: %s' % (
-                                        coef_x.norm().item() / norm_x, u_k,
-                                        ' '.join('%d:%.4f' % (age, c) for age, c in by_age)))
-                    nv = v.norm().item()
-                    if nv > GGR_MIN_RESIDUAL:
-                        U[u_ptr] = v / nv
-                        u_iters[u_ptr] = iters
-                        u_ptr = (u_ptr + 1) % U.shape[0]
-                        u_k = min(u_k + 1, U.shape[0])
-
-                if args.ggr == 'vlr' and g_w is not None:
-                    # Eq. (5) against the weighted class anchor g_w instead of g_x
-                    dot_wu = torch.dot(g_w, g_u_scope).item()
-                    norm_w_sq = torch.dot(g_w, g_w).item()
-                    if dot_wu < 0.0 and norm_w_sq > 0.0:
-                        c = dot_wu / norm_w_sq
-                        g_u_scope.add_(g_w, alpha=-c)
-                        delta_norm = abs(dot_wu) / norm_w_sq ** 0.5
-                        ggr_stats['grad/ggr_fired'] = 1.0
-                    else:
-                        ggr_stats['grad/ggr_fired'] = 0.0
-                    ggr_stats['grad/ggr_cos_u_gw_after'] = torch.dot(g_w, g_u_scope).item() / max(
-                        norm_w_sq ** 0.5 * g_u_scope.norm().item(), 1e-12)
-                elif args.ggr == 'vlr' and class_anchor:
-                    ggr_stats['grad/ggr_fired'] = 0.0  # no class seen yet: nothing to anchor on
-                elif args.ggr == 'vlr':
-                    # Eq. (5): fires only on a conflict, and removes exactly the
-                    # component of g_u that points along -g_s.
-                    if scope_dot_xs < 0.0 and scope_norm_x_sq > 0.0:
-                        c = scope_dot_xs / scope_norm_x_sq  # c < 0 here
-                        g_u_scope.add_(g_x_scope, alpha=-c)  # -c > 0: injects |c|*g_x
-                        delta_norm = abs(scope_dot_xs) / scope_norm_x_sq ** 0.5
-                        ggr_stats['grad/ggr_fired'] = 1.0
-                    else:
-                        ggr_stats['grad/ggr_fired'] = 0.0
-                elif args.ggr == 'cone':
-                    # exact projection of g_u onto the foreground cone
-                    # {g : <g, G_c> >= 0 for every seen foreground class}: the
-                    # minimal edit after which the pseudo-labels oppose no class
-                    # the labeled data has vouched for. Background (class 0) is
-                    # deliberately excluded -- it is the class the pseudo-labels
-                    # already favour, and including it makes the cone nearly
-                    # degenerate (GGR-class.md section 4.1). All math lives in
-                    # util/csr_cone.py; this branch only selects rows, copies
-                    # the result back and maps diagnostics to wandb keys.
-                    rows = seen.clone()
-                    rows[0] = False  # class 0 = background (util/classes.py)
-                    idx = rows.nonzero(as_tuple=True)[0]
-                    ggr_stats['grad/ggr_fired'] = 0.0
-                    if idx.numel() > 0:
-                        g_new, cone_diag = cone_rectify(proto[idx], g_u_scope)
-                        if cone_diag['fired']:
-                            g_u_scope.copy_(g_new)  # lands in flat_s; write-back below unchanged
-                            if args.ggr_cone_rescale > 0:
-                                # restore the step magnitude along the permitted directions:
-                                # ||P(g_u)|| = ||g_u|| sqrt(1 - edit_frac^2) (Moreau), so the
-                                # norm-matching factor is 1/sqrt(1 - ef^2); the clamp is the
-                                # apex guard (P -> 0 would otherwise blow the factor up).
-                                # Rescaling stays inside the cone (K is scale-invariant).
-                                ef = cone_diag['edit_frac']
-                                factor = min(args.ggr_cone_rescale,
-                                             max(1.0 - ef * ef, 1e-30) ** -0.5)
-                                g_u_scope.mul_(factor)
-                                ggr_stats['grad/ggr_cone_rescale_factor'] = factor
-                        delta_norm = cone_diag['delta_norm']
-                        ggr_stats.update({
-                            'grad/ggr_fired': cone_diag['fired'],
-                            'grad/ggr_cone_k': float(cone_diag['k']),
-                            'grad/ggr_cone_active': float(cone_diag['active']),
-                            'grad/ggr_cone_sweeps': float(cone_diag['sweeps']),
-                            'grad/ggr_cone_converged': float(cone_diag['converged']),
-                            'grad/ggr_cone_rho_feas': cone_diag['rho_feas'],
-                            'grad/ggr_cone_rho_comp': cone_diag['rho_comp'],
-                            'grad/ggr_cone_edit_frac': cone_diag['edit_frac'],
-                        })
-                        for i, ci in enumerate(idx.tolist()):
-                            cname = CLASSES[cfg['dataset']][ci]
-                            # lambda under grad/ggr_coef/* for parity with osr/csr
-                            ggr_stats['grad/ggr_coef/%s' % cname] = cone_diag['lam'][i]
-                            ggr_stats['grad/ggr_cone_q/%s' % cname] = cone_diag['q'][i]
-                            ggr_stats['grad/ggr_cone_s/%s' % cname] = cone_diag['s'][i]
-                elif u_k > 0:
-                    coef = U[:u_k] @ g_u_scope  # coordinates of g_u in the basis
-                    if class_anchor:
-                        # row i of the class basis is the residual direction of the i-th rarest
-                        # seen class; a negative coordinate is what csr clips
-                        for i, cidx in enumerate([int(c) for c in proto_order.tolist() if seen[c]][:u_k]):
-                            ggr_stats['grad/ggr_coef/%s' % CLASSES[cfg['dataset']][cidx]] = coef[i].item()
-                    if args.ggr == 'csr':
-                        # Eq. (8): clip only the coordinates opposing a stored anchor
-                        clipped = (coef < 0)
-                        ggr_stats['grad/ggr_fired'] = float(clipped.any().item())
-                        ggr_stats['grad/ggr_clipped_frac'] = clipped.float().mean().item()
-                        coef = coef.clamp(max=0.0)
-                    else:
-                        # Eq. (7): remove the whole component inside span(U)
-                        ggr_stats['grad/ggr_fired'] = 1.0
-                    # U has orthonormal rows, so ||U^T coef|| == ||coef||
-                    delta_norm = coef.norm().item()
-                    torch.addmv(g_u_scope, U[:u_k].t(), coef, beta=1.0, alpha=-1.0, out=g_u_scope)
-
-                # reassemble .grad = g_x + rectified g_u, on the scope only
-                for p, g_x, g_s in zip(params[scope_p_lo:scope_p_hi],
-                                       grad_x_acc[scope_p_lo:scope_p_hi],
-                                       grad_s_acc[scope_p_lo:scope_p_hi]):
-                    if p.grad is None:
-                        continue
-                    torch.add(g_x, g_s, out=p.grad)
-
-                # raw vs applied conflict (paper section C.1). Both are restricted to the
-                # surgery scope so they are directly comparable; grad/grad_cos_x_s stays
-                # whole-model and keeps its meaning across the pre-GGR run history.
-                # Expect >= 0 after vlr (Prop. 2) and ~0 after osr once the anchor is in
-                # span(U) (Prop. 4); csr only approximates non-opposition, so its
-                # cos_after can stay negative -- that gap is the paper's own caveat.
-                dot_after = torch.dot(g_x_scope, g_u_scope).item()
-                norm_s_after = g_u_scope.norm().item()
-                ggr_stats.update({
-                    'grad/ggr_cos_before': scope_dot_xs / max(
-                        (scope_norm_x_sq * scope_norm_s_sq) ** 0.5, 1e-12),
-                    'grad/ggr_cos_after': dot_after / max(scope_norm_x_sq ** 0.5 * norm_s_after, 1e-12),
-                    'grad/ggr_delta_norm': delta_norm,
-                    'grad/ggr_delta_rel': delta_norm / max(scope_norm_s_sq ** 0.5, 1e-12),
-                    'grad/ggr_subspace_k': float(u_k),
-                })
-
-                if U is not None and u_k > 1 and class_anchor and GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
-                    gram = U[:u_k] @ U[:u_k].t() - torch.eye(u_k, device=U.device, dtype=U.dtype)
-                    ggr_stats['grad/ggr_orth_err'] = gram.abs().max().item()
-                if U is not None and u_k > 1 and not class_anchor:
-                    if args.ggr_reorth_every and iters % args.ggr_reorth_every == 0:
-                        for a in range(u_k):  # modified Gram-Schmidt, in place
-                            for b in range(a):
-                                U[a] -= torch.dot(U[b], U[a]) * U[b]
-                            U[a] /= U[a].norm().clamp_min(1e-12)
-                    if GGR_ORTH_LOG_EVERY and iters % GGR_ORTH_LOG_EVERY == 0:
-                        gram = U[:u_k] @ U[:u_k].t() - torch.eye(u_k, device=U.device, dtype=U.dtype)
-                        ggr_stats['grad/ggr_orth_err'] = gram.abs().max().item()
+            # Rectify the unsupervised gradient against the supervised anchor and
+            # reassemble .grad on the surgery scope (util/ggr.py). Runs after the
+            # raw-conflict diagnostics above and before optimizer.step(), so
+            # grad/grad_cos_x_s keeps its meaning as the *pre*-rectification conflict
+            # metric (paper section C.1) while grad/ggr_cos_after is the
+            # post-rectification (applied) one. Empty ggr_stats under --ggr none.
+            ggr_stats, u_k, u_ptr = ggr_rectify(
+                args, iters=iters, flat_x=flat_x, flat_s=flat_s,
+                scope_lo=scope_lo, scope_hi=scope_hi, scope_p_lo=scope_p_lo, scope_p_hi=scope_p_hi,
+                params=params, grad_x_acc=grad_x_acc, grad_s_acc=grad_s_acc,
+                scope_norm_x_sq=scope_norm_x_sq, scope_norm_s_sq=scope_norm_s_sq,
+                scope_dot_xs=scope_dot_xs,
+                class_anchor=class_anchor, seen=seen, n_seen=n_seen,
+                proto=proto, proto_w=proto_w, proto_order=proto_order,
+                U=U, u_k=u_k, u_ptr=u_ptr, u_iters=u_iters, ggr_scratch=ggr_scratch,
+                class_names=CLASSES[cfg['dataset']], logger=logger)
             # ---------------------------- end GGR ----------------------------
 
             optimizer.step()
