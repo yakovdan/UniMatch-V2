@@ -126,6 +126,7 @@ parser.add_argument('--port', default=None, type=int)
 EFFECTIVE_BATCH = 16  # 4 GPUs x batch 4 in the paper
 GRAD_COS_CONFLICT_THRESH = -0.05  # cos(g_x, g_s) below this counts as a conflicting-gradient step
 GGR_CLASS_MIN_NORM = 1e-12  # a class prototype below this has no direction to contribute
+SMOKE_WARMUP_STEPS = 4  # steps of the epoch excluded from the --stop-after throughput clock (cudnn.benchmark autotunes there)
 # the per-step rectification and its own constants live in util/ggr.py
 
 
@@ -783,7 +784,7 @@ def main():
 
         model.train()
 
-        t_start, timed_steps = None, 0
+        t_start = None
 
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
@@ -959,15 +960,15 @@ def main():
                             '{:.3f}'.format(step, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg,
                                             total_loss_s.avg, total_mask_ratio.avg))
 
-            # skip the first steps when timing: cudnn.benchmark autotunes there
-            if step == 4:
+            # smoke-test throughput: the clock starts once the epoch's warm-up steps are
+            # done and is read at the stop below; a stop earlier than that prints no timing
+            if args.stop_after is not None and step == SMOKE_WARMUP_STEPS:
                 torch.cuda.synchronize()
                 t_start = time.time()
-            elif t_start is not None:
-                timed_steps = step - 4
 
             if args.stop_after is not None and iters + 1 >= args.stop_after:
                 torch.cuda.synchronize()
+                timed_steps = step - SMOKE_WARMUP_STEPS if t_start is not None else 0
                 if timed_steps > 0:
                     sec_per_step = (time.time() - t_start) / timed_steps
                     logger.info('Smoke test: {:.2f} s/step (avg over {} steps), total steps {}, projected {:.1f} h'.format(
