@@ -175,6 +175,38 @@ def pairwise_cos(rows, idx, n_cls):
     out[np.ix_(i, i)] = (r @ r.t()).float().cpu().numpy()
     return out
 
+def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt):
+    """Per-class supervised gradients of one labeled micro-batch, added in place to
+    the prototype accumulators.
+
+    For every class c present in ``mask_x`` (255 and ids beyond the accumulator are
+    skipped), the plain CE averaged over the pixels of c is backpropagated to
+    ``anchor_params`` -- one backward per class, with ``retain_graph`` so the caller's
+    full-loss backward can still walk the same graph -- and the gradient, flattened
+    and concatenated in ``anchor_params`` order (the layout of the flat gradient
+    buffers), is added to ``proto_acc[c]``; ``proto_cnt[c]`` counts the observation.
+    Parameters the loss does not reach (``allow_unused``) contribute nothing. Plain CE
+    regardless of criterion_l, so the prototypes mean the same thing under OHEM.
+
+    The backward runs in the precision the forward that produced ``pred_x`` recorded:
+    under --bf16 the head's convs are bf16 ops in that graph, so these gradients are
+    bf16-precision even though this function sits outside autocast.
+    """
+    n_cls = proto_acc.shape[0]
+    ce_px = F.cross_entropy(pred_x, mask_x, ignore_index=255, reduction='none')
+    for c in mask_x.unique().tolist():
+        if c == 255 or c >= n_cls:
+            continue
+        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), anchor_params,
+                                  retain_graph=True, allow_unused=True)
+        row, off = proto_acc[c], 0
+        for p, g in zip(anchor_params, g_c):
+            n = p.numel()
+            if g is not None:
+                row[off:off + n].add_(g.reshape(-1))
+            off += n
+        proto_cnt[c] += 1
+
 def update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates, beta=0.9):
     r"""Adam-style first-moment update of the per-class gradient prototypes, in place.
 
@@ -775,25 +807,9 @@ def main():
                     pred_x = model(img_x)
                     loss_x = criterion_l(pred_x, mask_x)
                 if proto is not None:
-                    # per-class supervised gradients of the head: CE averaged over the pixels of
-                    # each class present in this micro-batch, one head-only backward per class
-                    # (the graph is kept for the full-loss backward below). Plain CE regardless
-                    # of criterion_l so the prototypes mean the same thing under OHEM.
-                    ce_px = F.cross_entropy(pred_x, mask_x, ignore_index=255, reduction='none')
-                    g_c = None
-                    for c in mask_x.unique().tolist():
-                        if c == 255 or c >= proto.shape[0]:
-                            continue
-                        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), anchor_params,
-                                                  retain_graph=True, allow_unused=True)
-                        row, off = proto_acc[c], 0
-                        for p, g in zip(anchor_params, g_c):
-                            n = p.numel()
-                            if g is not None:
-                                row[off:off + n].add_(g.reshape(-1))
-                            off += n
-                        proto_cnt[c] += 1
-                    del ce_px, g_c
+                    # one anchor-scope backward per class present in the crop; the graph
+                    # is kept for the full-loss backward below
+                    accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt)
                 grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
                 for p, g_x, g in zip(params, grad_x_acc, grads):
                     if g is None:
