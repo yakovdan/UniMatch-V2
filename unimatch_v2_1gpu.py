@@ -5,6 +5,7 @@ import os
 import pprint
 import random
 import time
+from typing import NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -321,6 +322,55 @@ def apply_env_overrides(args, logger):
         setattr(args, attr, value)
         if value != previous:
             logger.info('%s=%s overrides --%s %s' % (env, value, attr.replace('_', '-'), previous))
+
+
+class MicroBatch(NamedTuple):
+    """One micro-batch on the GPU, ready for the student's forwards (see
+    load_micro_batch). The unlabeled fields are None under --sup-only."""
+    img_x: torch.Tensor
+    mask_x: torch.Tensor
+    img_u_s1: Optional[torch.Tensor] = None   # strong views, CutMix already applied
+    img_u_s2: Optional[torch.Tensor] = None
+    mask_u_w: Optional[torch.Tensor] = None   # teacher pseudo-label on the weak view
+    conf_u_w: Optional[torch.Tensor] = None   # teacher confidence on the weak view
+    ignore_mask: Optional[torch.Tensor] = None
+    cutmix_box1: Optional[torch.Tensor] = None
+    cutmix_box2: Optional[torch.Tensor] = None
+    mask_u_gt: Optional[torch.Tensor] = None  # GT of the unlabeled batch; not used by the loss yet
+
+
+def cutmix_(img, box):
+    """In-place CutMix of a strong view: inside `box` ((B, H, W), 1 = mix) every
+    image takes the pixels of the batch flipped along dim 0, i.e. image i receives
+    image B-1-i. The caller applies the same box to the pseudo-label, confidence and
+    ignore mask so the targets line up with the mixed images."""
+    sel = box.unsqueeze(1).expand(img.shape) == 1
+    img[sel] = img.flip(0)[sel]
+
+
+def load_micro_batch(loader, model_ema, sup_only, bf16):
+    """Pull the next micro-batch off `loader` and prepare what the student step
+    consumes: every tensor on the GPU, the teacher's (EMA model) pseudo-label and
+    confidence on the weak view, and CutMix applied to the two strong views. Under
+    --sup-only the loader yields only the labeled pair. Draws from no RNG: the
+    teacher runs in eval mode without Complementary Dropout."""
+    if sup_only:
+        img_x, mask_x = next(loader)
+        return MicroBatch(img_x.cuda(), mask_x.cuda())
+    (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
+    img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()
+    ignore_mask, cutmix_box1, cutmix_box2 = ignore_mask.cuda(), cutmix_box1.cuda(), cutmix_box2.cuda()
+    mask_u_gt = mask_u_gt.cuda()
+
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+        pred_u_w = model_ema(img_u_w)
+        conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+        mask_u_w = pred_u_w.argmax(dim=1)
+
+    cutmix_(img_u_s1, cutmix_box1)
+    cutmix_(img_u_s2, cutmix_box2)
+    return MicroBatch(img_x.cuda(), mask_x.cuda(), img_u_s1, img_u_s2, mask_u_w, conf_u_w,
+                      ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt)
 
 
 def main():
@@ -714,23 +764,8 @@ def main():
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
 
             for _ in range(accum):
-                if args.sup_only:
-                    img_x, mask_x = next(loader)
-                else:
-                    (img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt) = next(loader)
-                    img_u_w, img_u_s1, img_u_s2 = img_u_w.cuda(), img_u_s1.cuda(), img_u_s2.cuda()
-                    ignore_mask, cutmix_box1, cutmix_box2 = ignore_mask.cuda(), cutmix_box1.cuda(), cutmix_box2.cuda()
-                    mask_u_gt = mask_u_gt.cuda()  # GT of the unlabeled batch; not used by the loss yet
-
-                    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                        pred_u_w = model_ema(img_u_w).detach()
-                        conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-                        mask_u_w = pred_u_w.argmax(dim=1)
-
-                    img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = img_u_s1.flip(0)[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1]
-                    img_u_s2[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1] = img_u_s2.flip(0)[cutmix_box2.unsqueeze(1).expand(img_u_s2.shape) == 1]
-
-                img_x, mask_x = img_x.cuda(), mask_x.cuda()
+                mb = load_micro_batch(loader, model_ema, args.sup_only, args.bf16)
+                img_x, mask_x = mb.img_x, mb.mask_x
 
                 # labeled and unlabeled losses live in separate graphs, so
                 # backward each part right after its forward to halve peak memory.
@@ -778,18 +813,18 @@ def main():
                     mask_ratio = 0.0
                 else:
                     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
-                        pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2)), comp_drop=True).chunk(2)
+                        pred_u_s1, pred_u_s2 = model(torch.cat((mb.img_u_s1, mb.img_u_s2)), comp_drop=True).chunk(2)
 
-                    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
-                    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+                    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
+                    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
 
-                    mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w.flip(0)[cutmix_box1 == 1]
-                    conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w.flip(0)[cutmix_box1 == 1]
-                    ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask.flip(0)[cutmix_box1 == 1]
+                    mask_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box1 == 1]
+                    conf_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box1 == 1]
+                    ignore_mask_cutmixed1[mb.cutmix_box1 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box1 == 1]
 
-                    mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w.flip(0)[cutmix_box2 == 1]
-                    conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w.flip(0)[cutmix_box2 == 1]
-                    ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask.flip(0)[cutmix_box2 == 1]
+                    mask_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box2 == 1]
+                    conf_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box2 == 1]
+                    ignore_mask_cutmixed2[mb.cutmix_box2 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box2 == 1]
 
                     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.bf16):
                         loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
@@ -802,7 +837,7 @@ def main():
 
                         loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
                     (loss_u_s / (2.0 * accum)).backward()
-                    mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum().item()
+                    mask_ratio = ((mb.conf_u_w >= cfg['conf_thresh']) & (mb.ignore_mask != 255)).sum().item() / (mb.ignore_mask != 255).sum().item()
 
                 loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
 
