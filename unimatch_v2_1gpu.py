@@ -99,7 +99,9 @@ parser.add_argument('--ggr-reorth-every', type=int, default=0,
                          're-projects, so drift is normally negligible) [env: GGR_REORTH_EVERY]')
 parser.add_argument('--log-class-cos', action='store_true',
                     help='log the pairwise cosines of the per-class supervised DPT-head '
-                         'gradients every optimizer step, saved per epoch as '
+                         'gradients every optimizer step, plus per-class observation '
+                         'diagnostics (labeled pixel count, micro-batch appearances, observation '
+                         'norm, cosine to the pre-update prototype), saved per epoch as '
                          'class_cos_ep*.npz. Independent of --ggr [env: LOG_CLASS_COS]')
 parser.add_argument('--seed', type=int, default=0,
                     help='seed for model init, data order and augmentations. Each epoch is reseeded '
@@ -176,7 +178,7 @@ def pairwise_cos(rows, idx, n_cls):
     out[np.ix_(i, i)] = (r @ r.t()).float().cpu().numpy()
     return out
 
-def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt):
+def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt, proto_px=None):
     """Per-class supervised gradients of one labeled micro-batch, added in place to
     the prototype accumulators.
 
@@ -186,6 +188,9 @@ def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt):
     full-loss backward can still walk the same graph -- and the gradient, flattened
     and concatenated in ``anchor_params`` order (the layout of the flat gradient
     buffers), is added to ``proto_acc[c]``; ``proto_cnt[c]`` counts the observation.
+    When ``proto_px`` is given, ``proto_px[c]`` additionally accumulates the number of
+    class-c pixels the observation averaged over (the per-class evidence behind each
+    equal-weight observation; a diagnostic, it does not affect the prototypes).
     Parameters the loss does not reach (``allow_unused``) contribute nothing. Plain CE
     regardless of criterion_l, so the prototypes mean the same thing under OHEM.
 
@@ -198,7 +203,8 @@ def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt):
     for c in mask_x.unique().tolist():
         if c == 255 or c >= n_cls:
             continue
-        g_c = torch.autograd.grad(ce_px[mask_x == c].mean(), anchor_params,
+        sel = mask_x == c
+        g_c = torch.autograd.grad(ce_px[sel].mean(), anchor_params,
                                   retain_graph=True, allow_unused=True)
         row, off = proto_acc[c], 0
         for p, g in zip(anchor_params, g_c):
@@ -207,6 +213,8 @@ def accumulate_class_grads(pred_x, mask_x, anchor_params, proto_acc, proto_cnt):
                 row[off:off + n].add_(g.reshape(-1))
             off += n
         proto_cnt[c] += 1
+        if proto_px is not None:
+            proto_px[c] += sel.sum()
 
 def update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates, beta=0.9):
     r"""Adam-style first-moment update of the per-class gradient prototypes, in place.
@@ -238,19 +246,26 @@ def update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates, beta=0.9
     returned observations.
 
     Returns:
-        ``(obs, obs_cls)`` -- the step observations ``(k, D)`` and their class ids
-        ``(k,)``, or ``(None, None)`` when no class was observed this step.
+        ``(obs, obs_cls, cos_prev)`` -- the step observations ``(k, D)``, their class
+        ids ``(k,)`` and the cosine ``(k,)`` of each observation with the prototype it
+        is folded into, taken BEFORE this update (an out-of-sample alignment: how well
+        the running estimate predicted the new observation). NaN on a class's first
+        observation, where the prototype it replaces is the zero row. ``(None, None,
+        None)`` when no class was observed this step.
     """
     upd = proto_cnt > 0
     if not upd.any():
-        return None, None
+        return None, None, None
     obs_cls = upd.nonzero(as_tuple=True)[0]
     obs = proto_acc[upd] / proto_cnt[upd].unsqueeze(1)
+    prev = proto[upd]
+    cos_prev = (obs * prev).sum(1) / (obs.norm(dim=1) * prev.norm(dim=1)).clamp_min(1e-12)
+    cos_prev = torch.where(proto_updates[upd] > 0, cos_prev, torch.full_like(cos_prev, float('nan')))
     t = proto_updates[upd].to(proto.dtype) + 1.0   # index of THIS update, t >= 1
     r = (beta * (1.0 - beta ** (t - 1.0)) / (1.0 - beta ** t)).unsqueeze(1)
-    proto[upd] = r * proto[upd] + (1.0 - r) * obs
+    proto[upd] = r * prev + (1.0 - r) * obs
     proto_updates[upd] += 1
-    return obs, obs_cls
+    return obs, obs_cls, cos_prev
 
 
 
@@ -475,7 +490,7 @@ class MicroBatchLosses(NamedTuple):
 
 def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                       accum, conf_thresh, sup_only, bf16,
-                      anchor_params=None, proto_acc=None, proto_cnt=None):
+                      anchor_params=None, proto_acc=None, proto_cnt=None, proto_px=None):
     """One micro-batch of an optimizer step: load and prepare it (load_micro_batch),
     the labeled forward and loss, the per-class anchor gradients when prototypes are
     tracked, the supervised backward, then the unsupervised half
@@ -492,7 +507,8 @@ def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params
     untouched -- still None on the first call.
 
     Per-class gradients are accumulated iff ``proto_acc`` is given (--ggr-anchor
-    class or --log-class-cos); ``anchor_params`` and ``proto_cnt`` go with it.
+    class or --log-class-cos); ``anchor_params`` and ``proto_cnt`` go with it, and
+    ``proto_px`` (optional) receives the per-class labeled pixel counts.
 
     Returns the micro-batch's losses (MicroBatchLosses). The gradients are left in
     .grad and ``grad_x_acc``; the prototype accumulators are updated in place.
@@ -505,7 +521,7 @@ def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params
     if proto_acc is not None:
         # one anchor-scope backward per class present in the crop; the graph is kept
         # for the full-loss backward below
-        accumulate_class_grads(pred_x, mb.mask_x, anchor_params, proto_acc, proto_cnt)
+        accumulate_class_grads(pred_x, mb.mask_x, anchor_params, proto_acc, proto_cnt, proto_px)
     grads = torch.autograd.grad(loss_x / (2.0 * accum), params, allow_unused=True)
     for p, g_x, g in zip(params, grad_x_acc, grads):
         if g is None:
@@ -784,6 +800,7 @@ def main():
     # each class runs its Adam-style bias correction from its own first appearance
     # (see update_class_prototypes: proto stores the bias-corrected first moment).
     proto, proto_acc, proto_cnt, proto_updates, proto_w, proto_order, anchor_params = (None,) * 7
+    proto_px = None  # per-class labeled pixel counts of the current step (--log-class-cos diagnostic)
     # per-class prototypes are needed either as GGR anchors or purely as a diagnostic;
     # class_anchor is what the GGR block below keys on, so the log-only flag can never
     # redirect vlr/osr/csr away from their recent anchors
@@ -810,6 +827,8 @@ def main():
         proto_acc = torch.zeros_like(proto)
         proto_cnt = torch.zeros(n_cls, device=flat_x.device)
         proto_updates = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
+        if args.log_class_cos:
+            proto_px = torch.zeros(n_cls, dtype=torch.long, device=flat_x.device)
         logger.info('per-class anchor gradients (scope=%s): %d classes x D=%.2fM (%.2f GiB)\n' % (
             args.ggr_scope if class_anchor else 'head',
             n_cls, D_anchor / 1e6, 2 * proto.numel() * proto.element_size() / 2 ** 30))
@@ -847,7 +866,15 @@ def main():
         proto_updates.copy_(resume_proto[1].to(proto_updates.device))
         logger.info('GGR: restored class prototypes for %d classes from the checkpoint\n' % int((proto_updates > 0).sum()))
 
+    # --log-class-cos buffers, one entry per optimizer step, flushed per epoch. Besides the
+    # pairwise cosine matrices, per-class observation diagnostics (all (n_cls,) per step,
+    # absent classes 0 / NaN): obs_px labeled pixels the observation averaged over, obs_cnt
+    # micro-batches it appeared in, obs_norm ||obs_c||, obs_cos_prev cos(obs_c, prototype
+    # before this update) -- an out-of-sample alignment that, against obs_px, tells whether
+    # bigger observations are less noisy (pixel weighting) or not (appearance weighting) --
+    # and proto_norm after the update.
     cos_iters, cos_inst_log, cos_ema_log = [], [], []
+    obs_px_log, obs_cnt_log, obs_norm_log, obs_cos_prev_log, proto_norm_log = [], [], [], [], []
 
     def save_class_cos(ep):
         if not cos_iters:
@@ -855,10 +882,15 @@ def main():
         path = os.path.join(args.save_path, 'class_cos_ep%03d.npz' % ep)
         np.savez_compressed(path, iters=np.array(cos_iters),
                             cos_inst=np.stack(cos_inst_log), cos_ema=np.stack(cos_ema_log),
+                            obs_px=np.stack(obs_px_log), obs_cnt=np.stack(obs_cnt_log),
+                            obs_norm=np.stack(obs_norm_log), obs_cos_prev=np.stack(obs_cos_prev_log),
+                            proto_norm=np.stack(proto_norm_log),
                             classes=np.array(CLASSES[cfg['dataset']]))
         wandb.save(path, base_path=args.save_path)
-        logger.info('saved %d class-cosine matrices to %s' % (len(cos_iters), path))
-        cos_iters.clear(), cos_inst_log.clear(), cos_ema_log.clear()
+        logger.info('saved %d class-cosine matrices and observation diagnostics to %s' % (len(cos_iters), path))
+        for buf in (cos_iters, cos_inst_log, cos_ema_log, obs_px_log, obs_cnt_log,
+                    obs_norm_log, obs_cos_prev_log, proto_norm_log):
+            buf.clear()
 
     # the loop bound is capped but total_steps above is not, so a limited run walks
     # the first epoch_lim epochs of the full schedule instead of a compressed one
@@ -918,7 +950,8 @@ def main():
                 r = train_micro_batch(
                     loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                     accum, cfg['conf_thresh'], args.sup_only, args.bf16,
-                    anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt)
+                    anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt,
+                    proto_px=proto_px)
 
                 group_loss += r.loss / accum
                 group_loss_x += r.loss_x / accum
@@ -959,8 +992,8 @@ def main():
 
             seen, n_seen = None, 0
             if proto is not None:
-                obs, obs_cls = update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates,
-                                                       beta=args.proto_beta)
+                obs, obs_cls, obs_cos_prev = update_class_prototypes(proto, proto_acc, proto_cnt, proto_updates,
+                                                                     beta=args.proto_beta)
                 seen = (proto_updates > 0) & (proto.norm(dim=1) > GGR_CLASS_MIN_NORM)
                 n_seen = int(seen.sum())
                 if args.log_class_cos:
@@ -970,8 +1003,23 @@ def main():
                     cos_ema_log.append(pairwise_cos(proto[seen], seen.nonzero(as_tuple=True)[0],
                                                     cfg['nclass']))
                     cos_iters.append(iters)
+                    # per-class observation diagnostics; proto_cnt / proto_px still hold this
+                    # step's counts (zeroed just below)
+                    norm_row = np.full(cfg['nclass'], np.nan, dtype=np.float32)
+                    cos_row = np.full(cfg['nclass'], np.nan, dtype=np.float32)
+                    if obs is not None:
+                        idx = obs_cls.cpu().numpy()
+                        norm_row[idx] = obs.norm(dim=1).float().cpu().numpy()
+                        cos_row[idx] = obs_cos_prev.float().cpu().numpy()
+                    obs_px_log.append(proto_px.cpu().numpy().astype(np.int64))
+                    obs_cnt_log.append(proto_cnt.cpu().numpy().astype(np.int64))
+                    obs_norm_log.append(norm_row)
+                    obs_cos_prev_log.append(cos_row)
+                    proto_norm_log.append(proto.norm(dim=1).float().cpu().numpy())
                 proto_acc.zero_()
                 proto_cnt.zero_()
+                if proto_px is not None:
+                    proto_px.zero_()
                 del obs
 
             # ------------------------------ GGR ------------------------------

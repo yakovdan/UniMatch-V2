@@ -82,6 +82,26 @@ def test_matches_reference(seed):
     assert torch.equal(outs[0][1], outs[1][1])
 
 
+def test_pixel_counts_are_accumulated_without_touching_the_gradients():
+    feats, mask = toy_batch(3, classes=[0, 1, 4])
+    head = toy_head(3)
+    params = list(head.parameters())
+    acc, cnt = accumulators(params)
+    acc_ref, cnt_ref = accumulators(params)
+    px = torch.zeros(NCLASS, dtype=torch.long)
+    pred = head(feats)
+    accumulate_class_grads(pred, mask, params, acc, cnt, px)
+    accumulate_class_grads(pred, mask, params, acc_ref, cnt_ref)  # no proto_px: unchanged path
+    assert torch.equal(acc, acc_ref) and torch.equal(cnt, cnt_ref)
+    for c in range(NCLASS):
+        assert px[c] == (mask == c).sum()  # 0 for absent classes; 255 never counted
+    # a second micro-batch adds on top
+    feats2, mask2 = toy_batch(4, classes=[1, 2])
+    accumulate_class_grads(head(feats2), mask2, params, acc, cnt, px)
+    assert px[1] == (mask == 1).sum() + (mask2 == 1).sum()
+    assert px[2] == (mask2 == 2).sum() and px[4] == (mask == 4).sum()
+
+
 def test_each_row_is_the_gradient_of_the_mean_ce_over_that_class():
     feats, mask = toy_batch(0, classes=[0, 2, 3])  # classes 1 and 4 absent
     head = toy_head(0)
