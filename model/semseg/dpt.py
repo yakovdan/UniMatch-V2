@@ -133,6 +133,11 @@ class DPT(nn.Module):
         self.head = DPTHead(nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels)
         
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
+        # --unlock-after (unimatch_v2_1gpu.py): while True, forward() runs the backbone under
+        # no_grad, so its parameters stay out of the graph and receive no gradient at all
+        # (the trainer's AdamW then applies neither an update nor weight decay to them).
+        # A plain attribute, not a buffer: training-loop state, not checkpoint state.
+        self.backbone_frozen = False
         
     def lock_backbone(self):
         for p in self.backbone.parameters():
@@ -141,9 +146,11 @@ class DPT(nn.Module):
     def forward(self, x, comp_drop=False):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
         
-        features = self.backbone.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder_size]
-        )
+        # preserve the outer context: under no_grad / eval this changes nothing
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.backbone_frozen):
+            features = self.backbone.get_intermediate_layers(
+                x, self.intermediate_layer_idx[self.encoder_size]
+            )
         
         if comp_drop:
             bs, dim = features[0].shape[0], features[0].shape[-1]

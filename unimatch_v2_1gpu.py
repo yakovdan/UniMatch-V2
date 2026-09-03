@@ -63,6 +63,14 @@ parser.add_argument('--lock-backbone', action='store_true',
                     help="freeze the backbone (sets lock_backbone: True over the config): only the DPT head "
                          'trains; the backbone stays at the DINOv2 checkpoint in both student and teacher '
                          '[env: LOCK_BACKBONE]')
+parser.add_argument('--unlock-after', type=int, default=0,
+                    help='keep the backbone locked for the first N global optimizer steps (the counter '
+                         '--stop-after uses), then train it. Until then the DINOv2 weights stay at the '
+                         'checkpoint: they receive no gradient and no weight decay, and their Adam state '
+                         'starts at the unlock, at the poly LR of that step (no warmup). The head trains '
+                         'throughout. 0 = backbone trainable from step 0. The backbone stays in the '
+                         'optimizer, unlike --lock-backbone, so the two are exclusive. While locked, grad/* '
+                         'and GGR see zero backbone gradients, as under --lock-backbone [env: UNLOCK_AFTER]')
 parser.add_argument('--sup-only', action='store_true',
                     help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
@@ -165,6 +173,16 @@ def boolean(raw):
     if lowered in ('0', 'false', 'no', 'off'):
         return False
     raise ValueError
+
+def check_unlock_after(args, cfg):
+    """Validate --unlock-after against the effective config (after the lock_backbone override).
+
+    Under lock_backbone the backbone is excluded from ``params`` and from the optimizer, so an
+    unlock would silently do nothing; refuse the combination instead."""
+    if args.unlock_after < 0:
+        raise ValueError('--unlock-after must be >= 0 (got %d)' % args.unlock_after)
+    if args.unlock_after > 0 and cfg['lock_backbone']:
+        raise ValueError('--unlock-after needs a trainable backbone; drop --lock-backbone / lock_backbone: True')
 
 def pairwise_cos(rows, idx, n_cls):
     """(n_cls, n_cls) fp32 matrix of pairwise cosines between the per-class gradient
@@ -284,6 +302,7 @@ ENV_OVERRIDES = (
     ('EPOCH_LIM', 'epoch_lim', int, None),
     ('SUP_ONLY', 'sup_only', boolean, None),
     ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
+    ('UNLOCK_AFTER', 'unlock_after', int, None),
     ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
@@ -556,6 +575,7 @@ def main():
     apply_env_overrides(args, logger)
     if args.lock_backbone:
         cfg['lock_backbone'] = True
+    check_unlock_after(args, cfg)
     if args.lr is not None:
         cfg['lr'] = args.lr
     args.lr = cfg['lr']  # so all_args / W&B record the effective value either way
@@ -808,6 +828,10 @@ def main():
     if args.sup_only:
         logger.info('supervised-only: unsupervised branch skipped; loss_s, mask_ratio and the '
                     'grad/*_s diagnostics are a zero stub\n')
+    if args.unlock_after > 0:
+        logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
+                    'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
+                    % (args.unlock_after, total_steps))
     if class_anchor or args.log_class_cos:
         # Per-class supervised gradients live in the surgery-scope space: under
         # --ggr-scope head (the protocol default) that is the DPT head, laid out like
@@ -937,6 +961,15 @@ def main():
         t_start = None
 
         for step in range(steps_per_epoch):
+            iters = epoch * steps_per_epoch + step
+            # --unlock-after: while locked, the student's backbone runs under no_grad (DPT.forward),
+            # so its parameters never receive a gradient -- no update, no weight decay, no Adam
+            # state -- and every grad/GGR consumer skips them via `p.grad is None`. Recomputed from
+            # iters each step, so a resume lands in the right state without checkpointing anything.
+            backbone_locked = args.unlock_after > 0 and iters < args.unlock_after
+            if model.backbone_frozen and not backbone_locked:
+                logger.info('backbone unlocked at optimizer step %d (epoch %d, step %d)' % (iters, epoch, step))
+            model.backbone_frozen = backbone_locked
             optimizer.zero_grad()
             # one kernel each, now that the per-parameter buffers are views into these
             flat_x.zero_()
@@ -987,8 +1020,6 @@ def main():
             grad_cos_total_steps += 1
             grad_cos_conflict_steps += int(grad_cos_x_s < GRAD_COS_CONFLICT_THRESH)
             grad_cos_conflict_pct = 100.0 * grad_cos_conflict_steps / grad_cos_total_steps
-
-            iters = epoch * steps_per_epoch + step
 
             seen, n_seen = None, 0
             if proto is not None:
@@ -1064,7 +1095,9 @@ def main():
                 'grad/grad_cos_x_s': grad_cos_x_s,
                 'grad/grad_cos_x_s_lt_%g_pct' % GRAD_COS_CONFLICT_THRESH: grad_cos_conflict_pct,
                 'iters': iters,
-                **ggr_stats
+                **ggr_stats,
+                # only when the feature is on, so existing runs' metric sets are unchanged
+                **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {})
             })
 
             if step % max(steps_per_epoch // 8, 1) == 0:
