@@ -45,8 +45,13 @@ class AdamW(Optimizer):
             raise ValueError(f'Invalid beta parameter at index 1: {betas[1]}')
         if weight_decay < 0.0:
             raise ValueError(f'Invalid weight_decay value: {weight_decay}')
+        # accumulate_only (per param group, toggled by the trainer's --unlock-after --unlock-accumulate):
+        # keep the moment estimates and the step counter current from the gradients, but leave the
+        # parameters untouched -- no decoupled weight decay, no update -- so that when the flag is
+        # cleared the first applied step is an ordinary bias-corrected Adam step rather than the
+        # sign-like step an empty state produces.
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                        amsgrad=amsgrad, maximize=maximize)
+                        amsgrad=amsgrad, maximize=maximize, accumulate_only=False)
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -54,6 +59,7 @@ class AdamW(Optimizer):
         for group in self.param_groups:
             group.setdefault('amsgrad', False)
             group.setdefault('maximize', False)
+            group.setdefault('accumulate_only', False)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -69,6 +75,7 @@ class AdamW(Optimizer):
             weight_decay = group['weight_decay']
             amsgrad = group['amsgrad']
             maximize = group['maximize']
+            accumulate_only = group.get('accumulate_only', False)
 
             for p in group['params']:
                 if p.grad is None:
@@ -92,14 +99,21 @@ class AdamW(Optimizer):
                 state['step'] += 1
                 step = state['step'].item()
 
+                # first and second moment estimates (the weight decay below is independent of
+                # them, so updating the moments first changes nothing in the normal path)
+                exp_avg.lerp_(grad, 1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                if amsgrad:
+                    max_exp_avg_sq = state['max_exp_avg_sq']
+                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+
+                if accumulate_only:
+                    continue  # moments and step counter are warm; the parameter stays put
+
                 # decoupled weight decay: shrink the weights directly, independent of the
                 # adaptive step (this is what distinguishes AdamW from Adam + L2)
                 if weight_decay != 0:
                     p.mul_(1 - lr * weight_decay)
-
-                # first and second moment estimates
-                exp_avg.lerp_(grad, 1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
                 bias_correction1 = 1 - beta1 ** step
                 bias_correction2 = 1 - beta2 ** step
@@ -107,8 +121,6 @@ class AdamW(Optimizer):
                 bias_correction2_sqrt = math.sqrt(bias_correction2)
 
                 if amsgrad:
-                    max_exp_avg_sq = state['max_exp_avg_sq']
-                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
                     denom = (max_exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
                 else:
                     denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)

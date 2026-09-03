@@ -74,6 +74,34 @@ def test_adamw_leaves_params_without_grad_untouched():
     assert len(opt.state[locked]) == 0 and opt.state[free]['step'] == 1
 
 
+def test_adamw_accumulate_only_warms_moments_without_moving_params():
+    torch.manual_seed(0)
+    beta1, beta2, lr, wd = 0.9, 0.999, 0.1, 0.5
+    p = nn.Parameter(torch.randn(8)); p0 = p.detach().clone()
+    opt = AdamW([p], lr=lr, betas=(beta1, beta2), weight_decay=wd)
+    grads = [torch.randn(8) for _ in range(3)]
+    m = torch.zeros(8); v = torch.zeros(8)
+    # two accumulate-only steps: state fills in, parameter stays bitwise put (no decay either)
+    opt.param_groups[0]['accumulate_only'] = True
+    for g in grads[:2]:
+        p.grad = g.clone(); opt.step()
+        m = beta1 * m + (1 - beta1) * g; v = beta2 * v + (1 - beta2) * g * g
+    assert torch.equal(p, p0)
+    st = opt.state[p]
+    assert st['step'] == 2
+    torch.testing.assert_close(st['exp_avg'], m); torch.testing.assert_close(st['exp_avg_sq'], v)
+    # unlock: the next step is a normal AdamW step with bias correction at t=3, i.e. exactly what
+    # an optimizer that had seen all three gradients would do
+    opt.param_groups[0]['accumulate_only'] = False
+    p.grad = grads[2].clone(); opt.step()
+    m = beta1 * m + (1 - beta1) * grads[2]; v = beta2 * v + (1 - beta2) * grads[2] ** 2
+    expected = p0 * (1 - lr * wd) - lr / (1 - beta1 ** 3) * m / (v.sqrt() / (1 - beta2 ** 3) ** 0.5 + 1e-8)
+    torch.testing.assert_close(p.detach(), expected)
+    # the flag round-trips through the optimizer state dict and defaults to off
+    assert AdamW([nn.Parameter(torch.zeros(1))]).param_groups[0]['accumulate_only'] is False
+    sd = opt.state_dict(); assert sd['param_groups'][0]['accumulate_only'] is False
+
+
 def test_env_override_and_validation(monkeypatch):
     args = parser.parse_args(REQUIRED)
     assert args.unlock_after == 0
@@ -88,3 +116,10 @@ def test_env_override_and_validation(monkeypatch):
         check_unlock_after(args, {'lock_backbone': False})
     args.unlock_after = 0
     check_unlock_after(args, {'lock_backbone': True})  # off: any config is fine
+    # --unlock-accumulate needs an active lock; env override reaches it too
+    args.unlock_accumulate = True
+    with pytest.raises(ValueError):
+        check_unlock_after(args, {'lock_backbone': False})
+    monkeypatch.setenv('UNLOCK_ACCUMULATE', '0')
+    apply_env_overrides(args, logging.getLogger('test'))
+    assert args.unlock_accumulate is False

@@ -71,6 +71,14 @@ parser.add_argument('--unlock-after', type=int, default=0,
                          'throughout. 0 = backbone trainable from step 0. The backbone stays in the '
                          'optimizer, unlike --lock-backbone, so the two are exclusive. While locked, grad/* '
                          'and GGR see zero backbone gradients, as under --lock-backbone [env: UNLOCK_AFTER]')
+parser.add_argument('--unlock-accumulate', action='store_true',
+                    help='with --unlock-after: keep the backbone in the graph while locked so its gradient '
+                         'still flows, and let AdamW fold it into the first and second moments and the step '
+                         'counter without applying an update or weight decay. The weights stay at the '
+                         "checkpoint, but the first step after the unlock is an ordinary bias-corrected Adam "
+                         'step rather than the sign-like step an empty state produces. Costs the backbone '
+                         'backward during the lock; grad/* and GGR see the (unapplied) backbone gradient '
+                         '[env: UNLOCK_ACCUMULATE]')
 parser.add_argument('--sup-only', action='store_true',
                     help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
@@ -183,6 +191,8 @@ def check_unlock_after(args, cfg):
         raise ValueError('--unlock-after must be >= 0 (got %d)' % args.unlock_after)
     if args.unlock_after > 0 and cfg['lock_backbone']:
         raise ValueError('--unlock-after needs a trainable backbone; drop --lock-backbone / lock_backbone: True')
+    if args.unlock_accumulate and args.unlock_after <= 0:
+        raise ValueError('--unlock-accumulate only applies together with --unlock-after N > 0')
 
 def pairwise_cos(rows, idx, n_cls):
     """(n_cls, n_cls) fp32 matrix of pairwise cosines between the per-class gradient
@@ -303,6 +313,7 @@ ENV_OVERRIDES = (
     ('SUP_ONLY', 'sup_only', boolean, None),
     ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
     ('UNLOCK_AFTER', 'unlock_after', int, None),
+    ('UNLOCK_ACCUMULATE', 'unlock_accumulate', boolean, None),
     ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
@@ -828,7 +839,12 @@ def main():
     if args.sup_only:
         logger.info('supervised-only: unsupervised branch skipped; loss_s, mask_ratio and the '
                     'grad/*_s diagnostics are a zero stub\n')
-    if args.unlock_after > 0:
+    if args.unlock_after > 0 and args.unlock_accumulate:
+        logger.info('backbone locked for the first %d of %d optimizer steps, accumulating Adam moments: the '
+                    'DINOv2 weights receive no update and no weight decay until then, but their gradient '
+                    'flows into the first/second moments so the unlock starts from a warm state\n'
+                    % (args.unlock_after, total_steps))
+    elif args.unlock_after > 0:
         logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
                     'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
                     % (args.unlock_after, total_steps))
@@ -924,6 +940,8 @@ def main():
         logger.info('epoch_lim=%d: running %d of %d epochs; LR schedule spans all %d\n' % (
             args.epoch_lim, epoch_end, cfg['epochs'], cfg['epochs']))
 
+    backbone_was_locked = False  # --unlock-after bookkeeping, for the one-time unlock log line
+
     for epoch in range(epoch + 1, epoch_end):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
                     'EMA: {:.2f} @epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
@@ -967,9 +985,16 @@ def main():
             # state -- and every grad/GGR consumer skips them via `p.grad is None`. Recomputed from
             # iters each step, so a resume lands in the right state without checkpointing anything.
             backbone_locked = args.unlock_after > 0 and iters < args.unlock_after
-            if model.backbone_frozen and not backbone_locked:
+            if backbone_was_locked and not backbone_locked:
                 logger.info('backbone unlocked at optimizer step %d (epoch %d, step %d)' % (iters, epoch, step))
-            model.backbone_frozen = backbone_locked
+            backbone_was_locked = backbone_locked
+            if args.unlock_accumulate:
+                # --unlock-accumulate: gradients flow into the backbone and AdamW keeps its moments
+                # warm, but withholds the update and the decay for param group 0 (the backbone;
+                # lock_backbone is excluded above, so the group is populated)
+                optimizer.param_groups[0]['accumulate_only'] = backbone_locked
+            else:
+                model.backbone_frozen = backbone_locked
             optimizer.zero_grad()
             # one kernel each, now that the per-parameter buffers are views into these
             flat_x.zero_()
