@@ -602,25 +602,32 @@ def test_train_micro_batch_threads_the_referee_and_reports_its_stats():
 
 def test_abstention_flag_default_env_override_and_validation(monkeypatch):
     args = parser.parse_args(REQUIRED)
-    assert args.abstention is False
-    monkeypatch.setenv('ABSTENTION', 'true')
+    assert args.abstention == 0                       # off by default
+    monkeypatch.setenv('ABSTENTION', '700')
     apply_env_overrides(args, logging.getLogger('t'))
-    assert args.abstention is True
+    assert args.abstention == 700                     # K steps, from the environment
     check_unlock_after(args, {'lock_backbone': False})   # no lock needed: abstention is independent of it
     check_unlock_after(args, {'lock_backbone': True})    # ...and works with a permanently locked backbone
     args.unlock_after = 500
-    check_unlock_after(args, {'lock_backbone': False})   # and alongside a delayed unlock
+    check_unlock_after(args, {'lock_backbone': False})   # and alongside a delayed unlock (any K vs N)
     args.unlock_accumulate = True
     check_unlock_after(args, {'lock_backbone': False})   # accumulate is optional alongside it
     args.sup_only = True
     with pytest.raises(ValueError):                 # nothing to gate
         check_unlock_after(args, {'lock_backbone': False})
-    args.sup_only = False; args.unlock_after = 500
+    args.sup_only = False
+    args.abstention = -1
+    with pytest.raises(ValueError):                 # negative K is refused
+        check_unlock_after(args, {'lock_backbone': False})
+    args.abstention = 0; args.sup_only = True
+    check_unlock_after(args, {'lock_backbone': False})   # off: sup-only is fine again
+    args.sup_only = False
     with pytest.raises(ValueError):                 # unlock-after with lock_backbone is still refused
         check_unlock_after(args, {'lock_backbone': True})
-    monkeypatch.setenv('ABSTENTION', 'off')
+    monkeypatch.setenv('ABSTENTION', '0')
     apply_env_overrides(args, logging.getLogger('t'))
-    assert args.abstention is False
-    monkeypatch.setenv('ABSTENTION', 'maybe')
+    assert args.abstention == 0
+    monkeypatch.setenv('ABSTENTION', 'true')        # no longer a boolean
     with pytest.raises(ValueError):
         apply_env_overrides(args, logging.getLogger('t'))
+    assert parser.parse_args(REQUIRED + ['--abstention', '1311']).abstention == 1311

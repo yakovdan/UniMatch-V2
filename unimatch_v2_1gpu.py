@@ -80,15 +80,17 @@ parser.add_argument('--unlock-accumulate', action='store_true',
                          'step rather than the sign-like step an empty state produces. Costs the backbone '
                          'backward during the lock; grad/* and GGR see the (unapplied) backbone gradient '
                          '[env: UNLOCK_ACCUMULATE]')
-parser.add_argument('--abstention', action='store_true',
-                    help='gate the unsupervised loss with a second labeler for the whole run, independent '
-                         'of the backbone lock: a k-NN referee on frozen pretrained DINOv2 patch features '
-                         '(bank = the labeled images of the split, util/referee.py) labels the weak view '
-                         'alongside the teacher. Confident pixels where the two agree take the usual CE; '
-                         'where they disagree the abstention loss pushes down every class except the two '
-                         'candidates and takes no side between them. Logs train/abstain_ratio and '
-                         'teacher/referee/agreed accuracy against the unlabeled GT. Combines freely with '
-                         '--unlock-after / --unlock-accumulate; incompatible with --sup-only [env: ABSTENTION]')
+parser.add_argument('--abstention', type=int, default=0, metavar='K',
+                    help='gate the unsupervised loss with a second labeler for the first K global optimizer '
+                         'steps (the counter --stop-after and --unlock-after use), then return to the usual '
+                         'pseudo-label loss; 0 = off. The referee is a k-NN on frozen pretrained DINOv2 '
+                         'patch features (bank = the labeled images of the split, util/referee.py) labelling '
+                         'the weak view alongside the teacher. Confident pixels where the two agree take '
+                         'CE; where they disagree the abstention loss pushes down every class except the two '
+                         'candidates and takes no side between them. Independent of the backbone lock, '
+                         'combines freely with --unlock-after / --unlock-accumulate; incompatible with '
+                         '--sup-only. Logs train/abstain_ratio and teacher/referee/agreed accuracy against '
+                         'the unlabeled GT while active [env: ABSTENTION]')
 parser.add_argument('--sup-only', action='store_true',
                     help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
@@ -213,7 +215,9 @@ def check_unlock_after(args, cfg):
         raise ValueError('--unlock-after needs a trainable backbone; drop --lock-backbone / lock_backbone: True')
     if args.unlock_accumulate and args.unlock_after <= 0:
         raise ValueError('--unlock-accumulate only applies together with --unlock-after N > 0')
-    if args.abstention and args.sup_only:
+    if args.abstention < 0:
+        raise ValueError('--abstention K must be >= 0 (got %d); K = steps the gate stays active, 0 = off' % args.abstention)
+    if args.abstention > 0 and args.sup_only:
         raise ValueError('--abstention has no unsupervised loss to gate under --sup-only')
 
 def pairwise_cos(rows, idx, n_cls):
@@ -336,7 +340,7 @@ ENV_OVERRIDES = (
     ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
     ('UNLOCK_AFTER', 'unlock_after', int, None),
     ('UNLOCK_ACCUMULATE', 'unlock_accumulate', boolean, None),
-    ('ABSTENTION', 'abstention', boolean, None),
+    ('ABSTENTION', 'abstention', int, None),
     ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
@@ -769,7 +773,7 @@ def main():
     # epoch loop, whose per-epoch reseeding covers everything that follows. Absent the flag,
     # nothing here runs and the run is byte-identical to one without it.
     referee = None
-    if args.abstention:
+    if args.abstention > 0:
         referee = KNNReferee.from_pretrained(
             cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth', args.labeled_id_path,
             cfg['data_root'], cfg['dataset'], cfg['nclass'], logger=logger)
@@ -934,9 +938,10 @@ def main():
         logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
                     'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
                     % (args.unlock_after, total_steps))
-    if args.abstention:
-        logger.info('abstention gating active for the whole run (independent of the backbone lock): confident '
-                    'unlabeled pixels where teacher and referee agree take CE, disputed ones the abstention loss\n')
+    if args.abstention > 0:
+        logger.info('abstention gating active for the first %d of %d optimizer steps (independent of the backbone '
+                    'lock): confident unlabeled pixels where teacher and referee agree take CE, disputed ones the '
+                    'abstention loss; the usual pseudo-label loss from step %d on\n' % (args.abstention, total_steps, args.abstention))
     if class_anchor or args.log_class_cos:
         # Per-class supervised gradients live in the surgery-scope space: under
         # --ggr-scope head (the protocol default) that is the DPT head, laid out like
@@ -1030,6 +1035,7 @@ def main():
             args.epoch_lim, epoch_end, cfg['epochs'], cfg['epochs']))
 
     backbone_was_locked = False  # --unlock-after bookkeeping, for the one-time unlock log line
+    abstention_was_active = False  # --abstention K bookkeeping, for the one-time switch-off log line
 
     for epoch in range(epoch + 1, epoch_end):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -1090,9 +1096,14 @@ def main():
             flat_s.zero_()
 
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
-            # --abstention: the referee labels the weak view and gates the unsupervised loss for the
-            # whole run, independent of the backbone lock
-            abstention_active = args.abstention
+            # --abstention K: the referee labels the weak view and gates the unsupervised loss for the
+            # first K optimizer steps, independent of the backbone lock (recomputed from iters, so a
+            # resume lands in the right state)
+            abstention_active = args.abstention > 0 and iters < args.abstention
+            if abstention_was_active and not abstention_active:
+                logger.info('abstention gating off at optimizer step %d (epoch %d, step %d): usual pseudo-label loss from here'
+                            % (iters, epoch, step))
+            abstention_was_active = abstention_active
             group_abst = np.zeros(4)  # abstain_ratio, teacher_acc, referee_acc, agree_acc
 
             for _ in range(accum):
