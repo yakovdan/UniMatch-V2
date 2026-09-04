@@ -102,23 +102,21 @@ parser.add_argument('--frozen-grad', action='store_true',
                          'unsupervised parts; plus train/loss_x_frozen and train/loss_s_frozen, the losses of the '
                          'frozen-backbone model at the current head. Costs one extra forward+backward per '
                          'micro-batch; draws no RNG. Under a locked backbone the cosines are NaN [env: FROZEN_GRAD]')
-parser.add_argument('--pla', action='store_true',
+parser.add_argument('--pla', type=int, nargs='?', const=0, default=None, metavar='K',
                     help='pairwise layer-wise alignment of the backbone gradient with the frozen counterfactual '
-                         '(runs the --frozen-grad pass and logs its diagnostics while active): per parameter group '
-                         '(12 blocks, embeddings, final norm) and per '
-                         'half, the supervised gradient against the frozen supervised one and the unsupervised '
-                         'against the frozen unsupervised one, a group whose gradient opposes its counterfactual '
-                         '(negative inner product) is projected onto the plane orthogonal to it (one-way PCGrad / '
+                         'for the first K epochs (epochs 0..K-1), then plain training; K = 0 or a bare --pla aligns '
+                         'the whole run, absent = off. While active it runs the --frozen-grad pass and logs its '
+                         'diagnostics: per parameter group (12 blocks, embeddings, final norm) and per half, the '
+                         'supervised gradient against the frozen supervised one and the unsupervised against the '
+                         'frozen unsupervised one, a group whose gradient opposes its counterfactual (negative '
+                         'inner product) is projected onto the plane orthogonal to it (one-way PCGrad / '
                          "GGR's vlr rule; util/frozen_grad.py FrozenGrad.align). The frozen gradient is never "
                          'applied. Runs at step end before GGR, on the backbone only; the head is untouched. '
-                         'Refused with a locked backbone. Logs grad/pla_fired_{x,s}/<group>, the fraction fired '
-                         'and the kept norm per half [env: PLA]')
-parser.add_argument('--pla-steps', type=int, default=0, metavar='K',
-                    help='with --pla: align for the first K global optimizer steps only (the counter --stop-after '
-                         'and --abstention use), then plain training. The counterfactual pass stops there too, so '
-                         'the ~1.8x step cost is paid only inside the window, unless --frozen-grad is given '
-                         'explicitly, which keeps its diagnostics for the whole run; 0 = align the whole run '
-                         '[env: PLA_STEPS]')
+                         'Refused with a locked backbone. When the window closes the counterfactual pass stops '
+                         'with it, so its ~1.8x step cost is paid only inside the window, unless --frozen-grad is '
+                         'given explicitly, which keeps the diagnostics for the whole run. Logs '
+                         'grad/pla_fired_{x,s}/<group>, the fraction fired and the kept norm per half, and '
+                         'train/pla_active [env: PLA, same values]')
 parser.add_argument('--pla-target', type=str, default='both', choices=['both', 'sup', 'unsup'],
                     help='with --pla: which half to align -- both (default), only the supervised gradient or only '
                          'the unsupervised one [env: PLA_TARGET]')
@@ -259,11 +257,11 @@ def check_unlock_after(args, cfg):
         raise ValueError('--abstention K must be >= 0 (got %d); K = steps the gate stays active, 0 = off' % args.abstention)
     if args.abstention > 0 and args.sup_only:
         raise ValueError('--abstention has no unsupervised loss to gate under --sup-only')
-    if args.pla_steps < 0:
-        raise ValueError('--pla-steps K must be >= 0 (got %d); 0 = the whole run' % args.pla_steps)
-    if args.pla and cfg['lock_backbone']:
+    if args.pla is not None and args.pla < 0:
+        raise ValueError('--pla K must be >= 0 (got %d); K = epochs the alignment stays active, 0 = the whole run' % args.pla)
+    if args.pla is not None and cfg['lock_backbone']:
         raise ValueError('--pla aligns the backbone gradient; there is none under --lock-backbone / lock_backbone: True')
-    if args.pla and args.sup_only and args.pla_target == 'unsup':
+    if args.pla is not None and args.sup_only and args.pla_target == 'unsup':
         raise ValueError('--pla-target unsup has no unsupervised gradient to align under --sup-only')
     if args.eval_every_iter_images < 0:
         raise ValueError('--eval-every-iter-images N must be >= 0 (got %d); 0 = the whole val set' % args.eval_every_iter_images)
@@ -390,8 +388,7 @@ ENV_OVERRIDES = (
     ('UNLOCK_ACCUMULATE', 'unlock_accumulate', boolean, None),
     ('ABSTENTION', 'abstention', int, None),
     ('FROZEN_GRAD', 'frozen_grad', boolean, None),
-    ('PLA', 'pla', boolean, None),
-    ('PLA_STEPS', 'pla_steps', int, None),
+    ('PLA', 'pla', int, None),  # K epochs; 0 = the whole run (the old on/off spelling PLA=true is refused)
     ('PLA_TARGET', 'pla_target', str, ('both', 'sup', 'unsup')),
     ('EVAL_EVERY_ITER', 'eval_every_iter', boolean, None),
     ('EVAL_EVERY_ITER_IMAGES', 'eval_every_iter_images', int, None),
@@ -875,7 +872,7 @@ def main():
     # every micro-batch and only ever logged (util/frozen_grad.py). Same placement rationale as the
     # referee: after the DPT, before the epoch loop; absent the flag nothing here runs.
     frozen = None
-    if args.frozen_grad or args.pla:
+    if args.frozen_grad or args.pla is not None:
         frozen = FrozenGrad(model, cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth')
         logger.info('frozen-grad: counterfactual gradient of the frozen pretrained %s under the current head, '
                     'every micro-batch (one extra forward+backward each); %d parameter groups: %s; never applied\n'
@@ -1056,11 +1053,19 @@ def main():
         logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
                     'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
                     % (args.unlock_after, total_steps))
-    if args.pla:
+    if args.pla is not None:
+        if args.pla == 0:
+            pla_window = 'the whole run'
+        elif args.pla >= cfg['epochs']:
+            pla_window = 'the whole run (K=%d >= %d epochs)' % (args.pla, cfg['epochs'])
+        else:
+            pla_window = 'the first %d of %d epochs (%d of %d optimizer steps)' % (
+                args.pla, cfg['epochs'], args.pla * steps_per_epoch, total_steps)
         logger.info('pla: pairwise layer-wise alignment of the backbone gradient (%s) with the frozen counterfactual, '
                     'per group, one-way PCGrad, %s; the frozen gradient is never applied%s\n' % (
-                        args.pla_target, 'the whole run' if args.pla_steps == 0 else 'the first %d of %d optimizer steps' % (args.pla_steps, total_steps),
-                        '' if args.frozen_grad or args.pla_steps == 0 else '; the counterfactual pass stops with it (add --frozen-grad to keep its diagnostics)'))
+                        args.pla_target, pla_window,
+                        '' if args.frozen_grad or args.pla == 0 or args.pla >= cfg['epochs']
+                        else '; the counterfactual pass stops with it (add --frozen-grad to keep its diagnostics)'))
     if args.abstention > 0:
         logger.info('abstention gating active for the first %d of %d optimizer steps (independent of the backbone '
                     'lock): confident unlabeled pixels where teacher and referee agree take CE, disputed ones the '
@@ -1159,7 +1164,7 @@ def main():
 
     backbone_was_locked = False  # --unlock-after bookkeeping, for the one-time unlock log line
     abstention_was_active = False  # --abstention K bookkeeping, for the one-time switch-off log line
-    pla_was_active = False  # --pla-steps K bookkeeping, for the one-time switch-off log line
+    pla_was_active = False  # --pla K bookkeeping, for the one-time switch-off log line
 
     for epoch in range(epoch + 1, epoch_end):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -1227,9 +1232,10 @@ def main():
             # first K optimizer steps, independent of the backbone lock (recomputed from iters, so a
             # resume lands in the right state)
             abstention_active = args.abstention > 0 and iters < args.abstention
-            # --pla: alignment window; the counterfactual pass runs while the alignment is active or,
+            # --pla K: alignment window in epochs (K = 0: the whole run; recomputed from epoch, so a resume
+            # lands in the right state); the counterfactual pass runs while the alignment is active or,
             # under an explicit --frozen-grad, for the whole run (diagnostics only, ~1.8x step cost)
-            pla_active = args.pla and (args.pla_steps == 0 or iters < args.pla_steps)
+            pla_active = args.pla is not None and (args.pla == 0 or epoch < args.pla)
             if pla_was_active and not pla_active:
                 logger.info('pla off at optimizer step %d (epoch %d, step %d): plain backbone gradient from here%s' % (
                     iters, epoch, step, '' if args.frozen_grad else ', counterfactual pass stopped'))
@@ -1397,7 +1403,7 @@ def main():
                 **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {}),
                 **({'train/loss_x_frozen': group_frozen[0], 'train/loss_s_frozen': group_frozen[1], **frozen_stats}
                    if frozen_now is not None else {}),
-                **({'train/pla_active': float(pla_active), **pla_stats} if args.pla else {}),
+                **({'train/pla_active': float(pla_active), **pla_stats} if args.pla is not None else {}),
                 **eval_iter_log,
                 **({'train/abstain_ratio': group_abst[0], 'train/teacher_acc': group_abst[1],
                     'train/referee_acc': group_abst[2], 'train/agree_acc': group_abst[3],
