@@ -188,8 +188,9 @@ python feature_probe.py --report-npz analysis_outputs/feature_probe_layer11.npz 
   fine-tuned run and far above the merged model's 34 / 28.5 at 50%.
 - **But not from five sofa images.** With the 92 bank the raw features give sofa 28 and 35%
   leakage, and the class-mean classifier leaks 63%. Fine-tuning is what makes the features
-  linearly usable at 92: class-mean mIoU goes from 46 on the pretrained trunk to 75 on either
-  fine-tuned trunk. The merged basin pays for that with the pair.
+  linearly usable at 92: class-mean mIoU with the 92 bank is 45.7 on the pretrained trunk,
+  75.2 on the merged trunk and 73.1 on the separated one (49.1 / 75.2 / 73.4 with the 1464
+  bank; `--clf ncm`). The merged basin pays for that with the pair.
 - **The head adds nothing for the pair.** k-NN on each fine-tuned trunk with the 92 bank
   reproduces its full model: merged 34.9 / 27.0 at 48% against the model's 34.2 / 28.5 at
   50%; separated 48.8 / 35.0 at 19% against 49.5 / 39.8 at 13.5%. The head-swap result was not
