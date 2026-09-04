@@ -104,7 +104,8 @@ parser.add_argument('--frozen-grad', action='store_true',
                          'micro-batch; draws no RNG. Under a locked backbone the cosines are NaN [env: FROZEN_GRAD]')
 parser.add_argument('--pla', action='store_true',
                     help='pairwise layer-wise alignment of the backbone gradient with the frozen counterfactual '
-                         '(implies --frozen-grad): per parameter group (12 blocks, embeddings, final norm) and per '
+                         '(runs the --frozen-grad pass and logs its diagnostics while active): per parameter group '
+                         '(12 blocks, embeddings, final norm) and per '
                          'half, the supervised gradient against the frozen supervised one and the unsupervised '
                          'against the frozen unsupervised one, a group whose gradient opposes its counterfactual '
                          '(negative inner product) is projected onto the plane orthogonal to it (one-way PCGrad / '
@@ -114,8 +115,10 @@ parser.add_argument('--pla', action='store_true',
                          'and the kept norm per half [env: PLA]')
 parser.add_argument('--pla-steps', type=int, default=0, metavar='K',
                     help='with --pla: align for the first K global optimizer steps only (the counter --stop-after '
-                         'and --abstention use), then plain training with the frozen pass still logged; 0 = the '
-                         'whole run [env: PLA_STEPS]')
+                         'and --abstention use), then plain training. The counterfactual pass stops there too, so '
+                         'the ~1.8x step cost is paid only inside the window, unless --frozen-grad is given '
+                         'explicitly, which keeps its diagnostics for the whole run; 0 = align the whole run '
+                         '[env: PLA_STEPS]')
 parser.add_argument('--pla-target', type=str, default='both', choices=['both', 'sup', 'unsup'],
                     help='with --pla: which half to align -- both (default), only the supervised gradient or only '
                          'the unsupervised one [env: PLA_TARGET]')
@@ -262,8 +265,6 @@ def check_unlock_after(args, cfg):
         raise ValueError('--pla aligns the backbone gradient; there is none under --lock-backbone / lock_backbone: True')
     if args.pla and args.sup_only and args.pla_target == 'unsup':
         raise ValueError('--pla-target unsup has no unsupervised gradient to align under --sup-only')
-    if args.pla and not args.frozen_grad:
-        args.frozen_grad = True  # the alignment needs the counterfactual pass; keep the diagnostics with it
     if args.eval_every_iter_images < 0:
         raise ValueError('--eval-every-iter-images N must be >= 0 (got %d); 0 = the whole val set' % args.eval_every_iter_images)
 
@@ -874,7 +875,7 @@ def main():
     # every micro-batch and only ever logged (util/frozen_grad.py). Same placement rationale as the
     # referee: after the DPT, before the epoch loop; absent the flag nothing here runs.
     frozen = None
-    if args.frozen_grad:
+    if args.frozen_grad or args.pla:
         frozen = FrozenGrad(model, cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth')
         logger.info('frozen-grad: counterfactual gradient of the frozen pretrained %s under the current head, '
                     'every micro-batch (one extra forward+backward each); %d parameter groups: %s; never applied\n'
@@ -1057,8 +1058,9 @@ def main():
                     % (args.unlock_after, total_steps))
     if args.pla:
         logger.info('pla: pairwise layer-wise alignment of the backbone gradient (%s) with the frozen counterfactual, '
-                    'per group, one-way PCGrad, %s; the frozen gradient is never applied\n' % (
-                        args.pla_target, 'the whole run' if args.pla_steps == 0 else 'the first %d of %d optimizer steps' % (args.pla_steps, total_steps)))
+                    'per group, one-way PCGrad, %s; the frozen gradient is never applied%s\n' % (
+                        args.pla_target, 'the whole run' if args.pla_steps == 0 else 'the first %d of %d optimizer steps' % (args.pla_steps, total_steps),
+                        '' if args.frozen_grad or args.pla_steps == 0 else '; the counterfactual pass stops with it (add --frozen-grad to keep its diagnostics)'))
     if args.abstention > 0:
         logger.info('abstention gating active for the first %d of %d optimizer steps (independent of the backbone '
                     'lock): confident unlabeled pixels where teacher and referee agree take CE, disputed ones the '
@@ -1225,6 +1227,14 @@ def main():
             # first K optimizer steps, independent of the backbone lock (recomputed from iters, so a
             # resume lands in the right state)
             abstention_active = args.abstention > 0 and iters < args.abstention
+            # --pla: alignment window; the counterfactual pass runs while the alignment is active or,
+            # under an explicit --frozen-grad, for the whole run (diagnostics only, ~1.8x step cost)
+            pla_active = args.pla and (args.pla_steps == 0 or iters < args.pla_steps)
+            if pla_was_active and not pla_active:
+                logger.info('pla off at optimizer step %d (epoch %d, step %d): plain backbone gradient from here%s' % (
+                    iters, epoch, step, '' if args.frozen_grad else ', counterfactual pass stopped'))
+            pla_was_active = pla_active
+            frozen_now = frozen if frozen is not None and (args.frozen_grad or pla_active) else None
             if abstention_was_active and not abstention_active:
                 logger.info('abstention gating off at optimizer step %d (epoch %d, step %d): usual pseudo-label loss from here'
                             % (iters, epoch, step))
@@ -1240,12 +1250,12 @@ def main():
                     accum, cfg['conf_thresh'], args.sup_only, args.bf16,
                     anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt,
                     proto_px=proto_px, referee=referee if abstention_active else None, stats=abst,
-                    frozen=frozen)
+                    frozen=frozen_now)
 
                 group_loss += r.loss / accum
                 group_loss_x += r.loss_x / accum
                 group_loss_s += r.loss_s / accum
-                if frozen is not None:
+                if frozen_now is not None:
                     group_frozen += np.array([abst['loss_x_frozen'], abst['loss_s_frozen']]) / accum
                 if abstention_active:
                     group_abst += np.array([abst['abstain_ratio'], abst['teacher_acc'], abst['referee_acc'],
@@ -1286,14 +1296,10 @@ def main():
             # from the flat buffers here, BEFORE ggr_rectify edits flat_s on its scope. Under a locked
             # backbone (lock_backbone: n_backbone == 0; the --unlock-after window: buffers stay zero)
             # the trainable side is zero and every cosine NaN.
-            frozen_stats = frozen.step_stats(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone]) if frozen is not None else {}
+            frozen_stats = frozen.step_stats(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone]) if frozen_now is not None else {}
             # --pla: project each opposing (group, half) of the backbone gradient onto the plane orthogonal
             # to its counterfactual, in the flat buffers and .grad, after the pre-alignment diagnostics
             # above and before GGR (which under --ggr-scope all/backbone then reads the aligned buffers)
-            pla_active = args.pla and (args.pla_steps == 0 or iters < args.pla_steps)
-            if pla_was_active and not pla_active:
-                logger.info('pla off at optimizer step %d (epoch %d, step %d): plain backbone gradient from here' % (iters, epoch, step))
-            pla_was_active = pla_active
             pla_stats = frozen.align(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone], params[:n_backbone],
                                      args.pla_target) if pla_active else {}
 
@@ -1390,7 +1396,7 @@ def main():
                 # only when the feature is on, so existing runs' metric sets are unchanged
                 **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {}),
                 **({'train/loss_x_frozen': group_frozen[0], 'train/loss_s_frozen': group_frozen[1], **frozen_stats}
-                   if frozen is not None else {}),
+                   if frozen_now is not None else {}),
                 **({'train/pla_active': float(pla_active), **pla_stats} if args.pla else {}),
                 **eval_iter_log,
                 **({'train/abstain_ratio': group_abst[0], 'train/teacher_acc': group_abst[1],
@@ -1405,7 +1411,7 @@ def main():
                 if abstention_active:
                     logger.info('  abstention: disputed {:.3f} of counted pixels | acc vs unlabeled GT on confident pixels: '
                                 'teacher {:.3f}, referee {:.3f}, agreed {:.3f} | referee on all pixels {:.3f}'.format(*group_abst))
-                if frozen is not None:
+                if frozen_now is not None:
                     logger.info('  frozen-grad: loss x {:.3f} s {:.3f} | cos(frozen, trainable) all {:.4f} x {:.4f} s {:.4f} | '
                                 'norm ratio {:.3f} | per block: {}'.format(
                                     group_frozen[0], group_frozen[1], frozen_stats['grad/frozen_cos_all'],
