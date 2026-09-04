@@ -41,5 +41,8 @@ Reading:
   67.6, then potted plant or dining table 66.4 to 71.2. See
   `OSR-Adam-Beta-099-Split-366.md`.
 
-Source: per-run W&B pull `wandb_60ep.json` (job 1139d423 scratch, 2026-09-03 11:33), fields
-`cls_at_best` and `worst`; numbers cross-checked against the train logs' evaluation lines.
+Source: per-run W&B pull `wandb_60ep.json` (job 1139d423 scratch, 2026-09-03 11:33), field
+`cls_at_best`. Verified 2026-09-04 against the `Class [..] IoU: .., EMA: ..` lines of each
+run's train log at the best-EMA epoch: identical to two decimals at all five splits. Two
+values sit on a rounding boundary and appear 0.1 lower in tables parsed from the logs:
+sofa at 92 is 34.15 and chair at 366 is 48.05.
