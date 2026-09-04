@@ -23,6 +23,7 @@ from supervised import evaluate
 from util.classes import CLASSES
 from util.ggr import rectify as ggr_rectify
 from util.ohem import ProbOhemCrossEntropy2d
+from util.frozen_grad import FrozenGrad
 from util.referee import KNNReferee, abstention_loss_px
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
@@ -91,6 +92,42 @@ parser.add_argument('--abstention', type=int, default=0, metavar='K',
                          'combines freely with --unlock-after / --unlock-accumulate; incompatible with '
                          '--sup-only. Logs train/abstain_ratio and teacher/referee/agreed accuracy against '
                          'the unlabeled GT while active [env: ABSTENTION]')
+parser.add_argument('--frozen-grad', action='store_true',
+                    help='diagnostic: at every micro-batch also compute the exact gradient the FROZEN pretrained '
+                         'DINOv2 backbone would receive from the current head on the same images, targets and '
+                         'Complementary Dropout mask (util/frozen_grad.py), i.e. the locked-backbone counterfactual. '
+                         'Never applied. Logged per optimizer step as grad/frozen_*: cosine and norm ratio against '
+                         'the gradient the trainable backbone actually received (before GGR), per transformer block, '
+                         'embeddings and final norm and over the whole backbone, for the total, supervised and '
+                         'unsupervised parts; plus train/loss_x_frozen and train/loss_s_frozen, the losses of the '
+                         'frozen-backbone model at the current head. Costs one extra forward+backward per '
+                         'micro-batch; draws no RNG. Under a locked backbone the cosines are NaN [env: FROZEN_GRAD]')
+parser.add_argument('--pla', action='store_true',
+                    help='pairwise layer-wise alignment of the backbone gradient with the frozen counterfactual '
+                         '(implies --frozen-grad): per parameter group (12 blocks, embeddings, final norm) and per '
+                         'half, the supervised gradient against the frozen supervised one and the unsupervised '
+                         'against the frozen unsupervised one, a group whose gradient opposes its counterfactual '
+                         '(negative inner product) is projected onto the plane orthogonal to it (one-way PCGrad / '
+                         "GGR's vlr rule; util/frozen_grad.py FrozenGrad.align). The frozen gradient is never "
+                         'applied. Runs at step end before GGR, on the backbone only; the head is untouched. '
+                         'Refused with a locked backbone. Logs grad/pla_fired_{x,s}/<group>, the fraction fired '
+                         'and the kept norm per half [env: PLA]')
+parser.add_argument('--pla-steps', type=int, default=0, metavar='K',
+                    help='with --pla: align for the first K global optimizer steps only (the counter --stop-after '
+                         'and --abstention use), then plain training with the frozen pass still logged; 0 = the '
+                         'whole run [env: PLA_STEPS]')
+parser.add_argument('--pla-target', type=str, default='both', choices=['both', 'sup', 'unsup'],
+                    help='with --pla: which half to align -- both (default), only the supervised gradient or only '
+                         'the unsupervised one [env: PLA_TARGET]')
+parser.add_argument('--eval-every-iter', action='store_true',
+                    help='evaluate the student and the EMA teacher on val after EVERY optimizer step (the same '
+                         'evaluation the epoch end runs), logged as eval_iter/* under the iters step metric and '
+                         'a per-class train-log line. Draws no RNG. Costly: the full val set takes about a '
+                         'minute per model per step, so pair it with --eval-every-iter-images and/or '
+                         '--stop-after; the --stop-after clock includes the evaluations [env: EVAL_EVERY_ITER]')
+parser.add_argument('--eval-every-iter-images', type=int, default=0, metavar='N',
+                    help='with --eval-every-iter: evaluate on the first N val images only (the val list order); '
+                         '0 = the whole val set [env: EVAL_EVERY_ITER_IMAGES]')
 parser.add_argument('--sup-only', action='store_true',
                     help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
@@ -219,6 +256,16 @@ def check_unlock_after(args, cfg):
         raise ValueError('--abstention K must be >= 0 (got %d); K = steps the gate stays active, 0 = off' % args.abstention)
     if args.abstention > 0 and args.sup_only:
         raise ValueError('--abstention has no unsupervised loss to gate under --sup-only')
+    if args.pla_steps < 0:
+        raise ValueError('--pla-steps K must be >= 0 (got %d); 0 = the whole run' % args.pla_steps)
+    if args.pla and cfg['lock_backbone']:
+        raise ValueError('--pla aligns the backbone gradient; there is none under --lock-backbone / lock_backbone: True')
+    if args.pla and args.sup_only and args.pla_target == 'unsup':
+        raise ValueError('--pla-target unsup has no unsupervised gradient to align under --sup-only')
+    if args.pla and not args.frozen_grad:
+        args.frozen_grad = True  # the alignment needs the counterfactual pass; keep the diagnostics with it
+    if args.eval_every_iter_images < 0:
+        raise ValueError('--eval-every-iter-images N must be >= 0 (got %d); 0 = the whole val set' % args.eval_every_iter_images)
 
 def pairwise_cos(rows, idx, n_cls):
     """(n_cls, n_cls) fp32 matrix of pairwise cosines between the per-class gradient
@@ -341,6 +388,12 @@ ENV_OVERRIDES = (
     ('UNLOCK_AFTER', 'unlock_after', int, None),
     ('UNLOCK_ACCUMULATE', 'unlock_accumulate', boolean, None),
     ('ABSTENTION', 'abstention', int, None),
+    ('FROZEN_GRAD', 'frozen_grad', boolean, None),
+    ('PLA', 'pla', boolean, None),
+    ('PLA_STEPS', 'pla_steps', int, None),
+    ('PLA_TARGET', 'pla_target', str, ('both', 'sup', 'unsup')),
+    ('EVAL_EVERY_ITER', 'eval_every_iter', boolean, None),
+    ('EVAL_EVERY_ITER_IMAGES', 'eval_every_iter_images', int, None),
     ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
@@ -482,6 +535,45 @@ def load_micro_batch(loader, model_ema, sup_only, bf16, referee=None):
                       ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt, ref_u_w)
 
 
+def unsup_loss(pred_u_s1, pred_u_s2, mb, criterion_u, conf_thresh, bf16):
+    """The unsupervised loss of one micro-batch given the student's logits on the two
+    strong views: the confidence-masked consistency loss against the teacher's CutMixed
+    pseudo-label, abstention-gated when ``mb.ref_u_w`` is set (see unsup_forward_backward
+    for the full semantics). Returns ``(loss_u_s, disputed)``: the unscaled 0-dim loss
+    and, per view, the disputed fraction of the counted pixels (empty when ungated).
+    Split out of unsup_forward_backward so the counterfactual pass of --frozen-grad
+    (util/frozen_grad.py) scores the frozen backbone's logits with the identical loss."""
+    gated = mb.ref_u_w is not None
+
+    def cutmixed(box):
+        """The teacher's pseudo-label, confidence, ignore mask (and referee label) mixed with `box`."""
+        sel = box == 1
+        outs = []
+        for src in (mb.mask_u_w, mb.conf_u_w, mb.ignore_mask) + ((mb.ref_u_w,) if gated else ()):
+            dst = src.clone()
+            dst[sel] = src.flip(0)[sel]
+            outs.append(dst)
+        return outs
+
+    def view_loss(pred, mixed):
+        mask_cm, conf_cm, ign_cm = mixed[:3]
+        valid = (conf_cm >= conf_thresh) & (ign_cm != 255)
+        loss_px = criterion_u(pred, mask_cm)
+        if gated:
+            agree = mask_cm == mixed[3]
+            loss_px = torch.where(agree, loss_px, abstention_loss_px(pred, mask_cm, mixed[3]))
+            n_valid = valid.sum().item()
+            disputed.append((valid & ~agree).sum().item() / max(n_valid, 1))
+        return (loss_px * valid).sum() / (ign_cm != 255).sum().item()
+
+    disputed = []
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+        loss_u_s1 = view_loss(pred_u_s1, cutmixed(mb.cutmix_box1))
+        loss_u_s2 = view_loss(pred_u_s2, cutmixed(mb.cutmix_box2))
+        loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
+    return loss_u_s, disputed
+
+
 def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16, stats=None):
     """The unsupervised half of one micro-batch: the student's forward on the two
     strong views, the confidence-masked consistency loss against the teacher's
@@ -534,33 +626,7 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
         pred_u_s1, pred_u_s2 = model(torch.cat((mb.img_u_s1, mb.img_u_s2)), comp_drop=True).chunk(2)
 
     gated = mb.ref_u_w is not None
-
-    def cutmixed(box):
-        """The teacher's pseudo-label, confidence, ignore mask (and referee label) mixed with `box`."""
-        sel = box == 1
-        outs = []
-        for src in (mb.mask_u_w, mb.conf_u_w, mb.ignore_mask) + ((mb.ref_u_w,) if gated else ()):
-            dst = src.clone()
-            dst[sel] = src.flip(0)[sel]
-            outs.append(dst)
-        return outs
-
-    def view_loss(pred, mixed):
-        mask_cm, conf_cm, ign_cm = mixed[:3]
-        valid = (conf_cm >= conf_thresh) & (ign_cm != 255)
-        loss_px = criterion_u(pred, mask_cm)
-        if gated:
-            agree = mask_cm == mixed[3]
-            loss_px = torch.where(agree, loss_px, abstention_loss_px(pred, mask_cm, mixed[3]))
-            n_valid = valid.sum().item()
-            disputed.append((valid & ~agree).sum().item() / max(n_valid, 1))
-        return (loss_px * valid).sum() / (ign_cm != 255).sum().item()
-
-    disputed = []
-    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
-        loss_u_s1 = view_loss(pred_u_s1, cutmixed(mb.cutmix_box1))
-        loss_u_s2 = view_loss(pred_u_s2, cutmixed(mb.cutmix_box2))
-        loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
+    loss_u_s, disputed = unsup_loss(pred_u_s1, pred_u_s2, mb, criterion_u, conf_thresh, bf16)
     (loss_u_s / (2.0 * accum)).backward()
     mask_ratio = ((mb.conf_u_w >= conf_thresh) & (mb.ignore_mask != 255)).sum().item() / (mb.ignore_mask != 255).sum().item()
 
@@ -594,11 +660,17 @@ class MicroBatchLosses(NamedTuple):
 def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                       accum, conf_thresh, sup_only, bf16,
                       anchor_params=None, proto_acc=None, proto_cnt=None, proto_px=None, referee=None,
-                      stats=None):
+                      stats=None, frozen=None):
     """One micro-batch of an optimizer step: load and prepare it (load_micro_batch),
     the labeled forward and loss, the per-class anchor gradients when prototypes are
     tracked, the supervised backward, then the unsupervised half
-    (unsup_forward_backward).
+    (unsup_forward_backward), and finally, with a ``frozen`` (util.frozen_grad.FrozenGrad;
+    --frozen-grad), the counterfactual pass: the same two losses recomputed with the
+    frozen pretrained backbone under the current head, same targets and same dropout
+    mask, whose gradient w.r.t. the frozen weights accumulates in ``frozen`` and whose
+    losses land in ``stats`` as ``loss_x_frozen`` / ``loss_s_frozen`` (NaN under
+    --sup-only for the latter). It runs after both student backwards, so it touches
+    neither .grad nor any RNG.
 
     The labeled and unlabeled losses live in separate graphs, so each part backwards
     right after its own forward, which halves peak memory. The labeled part uses
@@ -641,6 +713,19 @@ def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params
     # gradient just accumulated there (zero stub under --sup-only)
     loss_u_s, mask_ratio = unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16,
                                                   stats=stats)
+
+    if frozen is not None:
+        def loss_x_fn(pred):
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+                return criterion_l(pred, mb.mask_x)
+        img_u, loss_u_fn, dropout_mask = None, None, None
+        if not sup_only:
+            img_u = torch.cat((mb.img_u_s1, mb.img_u_s2))
+            loss_u_fn = lambda p1, p2: unsup_loss(p1, p2, mb, criterion_u, conf_thresh, bf16)[0]
+            dropout_mask = model.last_dropout_mask  # the mask the student's strong-view forward just used
+        lx0, ls0 = frozen.micro_batch(model, mb.img_x, loss_x_fn, img_u, loss_u_fn, dropout_mask, accum, bf16)
+        if stats is not None:
+            stats['loss_x_frozen'], stats['loss_s_frozen'] = lx0.item(), ls0.item()
 
     loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
     return MicroBatchLosses(loss.item(), loss_x.item(), loss_u_s.item(), mask_ratio)
@@ -785,6 +870,16 @@ def main():
             cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth', args.labeled_id_path,
             cfg['data_root'], cfg['dataset'], cfg['nclass'], logger=logger)
 
+    # --frozen-grad: a frozen copy of the pretrained trunk whose counterfactual gradient is computed
+    # every micro-batch and only ever logged (util/frozen_grad.py). Same placement rationale as the
+    # referee: after the DPT, before the epoch loop; absent the flag nothing here runs.
+    frozen = None
+    if args.frozen_grad:
+        frozen = FrozenGrad(model, cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth')
+        logger.info('frozen-grad: counterfactual gradient of the frozen pretrained %s under the current head, '
+                    'every micro-batch (one extra forward+backward each); %d parameter groups: %s; never applied\n'
+                    % (cfg['backbone'], len(frozen.group_names), ' '.join(frozen.group_names)))
+
     # (student, teacher) pairs for the EMA update, with and without the backbone (see ema_update).
     # Membership by identity rather than by position in model.parameters().
     ema_pairs_all = list(zip(model.parameters(), model_ema.parameters()))
@@ -832,6 +927,21 @@ def main():
     valloader = DataLoader(
         valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, generator=gen_val
     )
+    # --eval-every-iter: its own loader (a prefix of val, or all of it) with its own generator, so the
+    # per-step evaluations draw nothing from the training streams' RNGs
+    valloader_iter = None
+    if args.eval_every_iter:
+        n_img = len(valset) if args.eval_every_iter_images <= 0 else min(args.eval_every_iter_images, len(valset))
+        gen_val_iter = torch.Generator()
+        gen_val_iter.manual_seed(args.seed + 4)
+        valset_iter = valset if n_img == len(valset) else torch.utils.data.Subset(valset, range(n_img))
+        valloader_iter = DataLoader(
+            valset_iter, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, generator=gen_val_iter
+        )
+        wandb.define_metric('eval_iter/*', step_metric='iters')
+        logger.info('eval-every-iter: student and EMA teacher evaluated on the first %d of %d val images after every '
+                    'optimizer step (eval_iter/*); the --stop-after clock includes it\n' % (n_img, len(valset)))
+    eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
 
     # partially filled accumulation groups at epoch end are dropped, so leftover
     # gradients can never leak into the next epoch's first optimizer step
@@ -945,6 +1055,10 @@ def main():
         logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
                     'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
                     % (args.unlock_after, total_steps))
+    if args.pla:
+        logger.info('pla: pairwise layer-wise alignment of the backbone gradient (%s) with the frozen counterfactual, '
+                    'per group, one-way PCGrad, %s; the frozen gradient is never applied\n' % (
+                        args.pla_target, 'the whole run' if args.pla_steps == 0 else 'the first %d of %d optimizer steps' % (args.pla_steps, total_steps)))
     if args.abstention > 0:
         logger.info('abstention gating active for the first %d of %d optimizer steps (independent of the backbone '
                     'lock): confident unlabeled pixels where teacher and referee agree take CE, disputed ones the '
@@ -1043,6 +1157,7 @@ def main():
 
     backbone_was_locked = False  # --unlock-after bookkeeping, for the one-time unlock log line
     abstention_was_active = False  # --abstention K bookkeeping, for the one-time switch-off log line
+    pla_was_active = False  # --pla-steps K bookkeeping, for the one-time switch-off log line
 
     for epoch in range(epoch + 1, epoch_end):
         logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
@@ -1101,8 +1216,11 @@ def main():
             # one kernel each, now that the per-parameter buffers are views into these
             flat_x.zero_()
             flat_s.zero_()
+            if frozen is not None:
+                frozen.zero_()
 
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
+            group_frozen = np.zeros(2)  # --frozen-grad: loss_x_frozen, loss_s_frozen (mean over the step)
             # --abstention K: the referee labels the weak view and gates the unsupervised loss for the
             # first K optimizer steps, independent of the backbone lock (recomputed from iters, so a
             # resume lands in the right state)
@@ -1121,11 +1239,14 @@ def main():
                     loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                     accum, cfg['conf_thresh'], args.sup_only, args.bf16,
                     anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt,
-                    proto_px=proto_px, referee=referee if abstention_active else None, stats=abst)
+                    proto_px=proto_px, referee=referee if abstention_active else None, stats=abst,
+                    frozen=frozen)
 
                 group_loss += r.loss / accum
                 group_loss_x += r.loss_x / accum
                 group_loss_s += r.loss_s / accum
+                if frozen is not None:
+                    group_frozen += np.array([abst['loss_x_frozen'], abst['loss_s_frozen']]) / accum
                 if abstention_active:
                     group_abst += np.array([abst['abstain_ratio'], abst['teacher_acc'], abst['referee_acc'],
                                             abst['agree_acc'], abst['referee_acc_all']]) / accum
@@ -1160,6 +1281,21 @@ def main():
             grad_cos_total_steps += 1
             grad_cos_conflict_steps += int(grad_cos_x_s < GRAD_COS_CONFLICT_THRESH)
             grad_cos_conflict_pct = 100.0 * grad_cos_conflict_steps / grad_cos_total_steps
+
+            # --frozen-grad: compare the counterfactual gradient with the trainable backbone's, read
+            # from the flat buffers here, BEFORE ggr_rectify edits flat_s on its scope. Under a locked
+            # backbone (lock_backbone: n_backbone == 0; the --unlock-after window: buffers stay zero)
+            # the trainable side is zero and every cosine NaN.
+            frozen_stats = frozen.step_stats(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone]) if frozen is not None else {}
+            # --pla: project each opposing (group, half) of the backbone gradient onto the plane orthogonal
+            # to its counterfactual, in the flat buffers and .grad, after the pre-alignment diagnostics
+            # above and before GGR (which under --ggr-scope all/backbone then reads the aligned buffers)
+            pla_active = args.pla and (args.pla_steps == 0 or iters < args.pla_steps)
+            if pla_was_active and not pla_active:
+                logger.info('pla off at optimizer step %d (epoch %d, step %d): plain backbone gradient from here' % (iters, epoch, step))
+            pla_was_active = pla_active
+            pla_stats = frozen.align(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone], params[:n_backbone],
+                                     args.pla_target) if pla_active else {}
 
             seen, n_seen = None, 0
             if proto is not None:
@@ -1225,6 +1361,20 @@ def main():
             ema_update(ema_pairs_head if backbone_frozen_now else ema_pairs_all, ema_ratio)
             ema_update(ema_bufs_head if backbone_frozen_now else ema_bufs_all, ema_ratio)
 
+            # --eval-every-iter: the epoch-end evaluation after this step, on the per-step loader. evaluate()
+            # runs in eval mode under no_grad and draws no RNG, but leaves the student in eval mode, restored here
+            eval_iter_log = {}
+            if valloader_iter is not None:
+                mIoU_i, cls_i = evaluate(model, valloader_iter, eval_mode, cfg, multiplier=14)
+                mIoU_ema_i, cls_ema_i = evaluate(model_ema, valloader_iter, eval_mode, cfg, multiplier=14)
+                model.train()
+                names = CLASSES[cfg['dataset']]
+                eval_iter_log = {'eval_iter/mIoU': float(mIoU_i), 'eval_iter/mIoU_ema': float(mIoU_ema_i),
+                                 **{'eval_iter/%s_IoU' % c: float(v) for c, v in zip(names, cls_i)},
+                                 **{'eval_iter/%s_IoU_ema' % c: float(v) for c, v in zip(names, cls_ema_i)}}
+                logger.info('eval@iter %d: mIoU %.2f, EMA %.2f | student/EMA per class: %s' % (
+                    iters, mIoU_i, mIoU_ema_i, ' '.join('%s %.1f/%.1f' % (c, a, b) for c, a, b in zip(names, cls_i, cls_ema_i))))
+
             wandb.log({
                 'train/loss_all': group_loss,
                 'train/loss_x': group_loss_x,
@@ -1239,6 +1389,10 @@ def main():
                 **ggr_stats,
                 # only when the feature is on, so existing runs' metric sets are unchanged
                 **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {}),
+                **({'train/loss_x_frozen': group_frozen[0], 'train/loss_s_frozen': group_frozen[1], **frozen_stats}
+                   if frozen is not None else {}),
+                **({'train/pla_active': float(pla_active), **pla_stats} if args.pla else {}),
+                **eval_iter_log,
                 **({'train/abstain_ratio': group_abst[0], 'train/teacher_acc': group_abst[1],
                     'train/referee_acc': group_abst[2], 'train/agree_acc': group_abst[3],
                     'train/referee_acc_all': group_abst[4]} if abstention_active else {})
@@ -1251,6 +1405,18 @@ def main():
                 if abstention_active:
                     logger.info('  abstention: disputed {:.3f} of counted pixels | acc vs unlabeled GT on confident pixels: '
                                 'teacher {:.3f}, referee {:.3f}, agreed {:.3f} | referee on all pixels {:.3f}'.format(*group_abst))
+                if frozen is not None:
+                    logger.info('  frozen-grad: loss x {:.3f} s {:.3f} | cos(frozen, trainable) all {:.4f} x {:.4f} s {:.4f} | '
+                                'norm ratio {:.3f} | per block: {}'.format(
+                                    group_frozen[0], group_frozen[1], frozen_stats['grad/frozen_cos_all'],
+                                    frozen_stats['grad/frozen_cos_x_all'], frozen_stats['grad/frozen_cos_s_all'],
+                                    frozen_stats['grad/frozen_norm_ratio_all'],
+                                    ' '.join('%.3f' % frozen_stats['grad/frozen_cos/' + g] for g in frozen.group_names)))
+                if pla_active:
+                    logger.info('  pla: fired x {:.0f}/{} s {:.0f}/{} groups | kept norm x {:.3f} s {:.3f}'.format(
+                        pla_stats.get('grad/pla_fired_x_frac', float('nan')) * len(frozen.group_names), len(frozen.group_names),
+                        pla_stats.get('grad/pla_fired_s_frac', float('nan')) * len(frozen.group_names), len(frozen.group_names),
+                        pla_stats.get('grad/pla_norm_kept_x', float('nan')), pla_stats.get('grad/pla_norm_kept_s', float('nan'))))
 
             # smoke-test throughput: the clock starts once the epoch's warm-up steps are
             # done and is read at the stop below; a stop earlier than that prints no timing
@@ -1272,7 +1438,6 @@ def main():
 
         save_class_cos(epoch)
 
-        eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
         mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=14)
         # evaluate returns np.mean(...), a numpy scalar, which propagates into

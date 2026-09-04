@@ -106,9 +106,10 @@ def build_bank(bb, ids, data_root, dataset, layer, nclass, purity=PURITY, num_wo
 
 
 @torch.no_grad()
-def knn_scores(q, bank_f, bank_y, k, nclass, chunk=BANK_CHUNK):
-    """(P, nclass) similarity-weighted votes of the k nearest bank patches for queries q (P, C)
-    fp16; the bank is streamed in chunks so the similarity matrix never exceeds P x chunk."""
+def knn_topk(q, bank_f, bank_y, k, chunk=BANK_CHUNK):
+    """The k nearest bank patches of each query q (P, C) fp16: their cosine similarities (P, k)
+    fp16, sorted descending, and their labels (P, k); the bank is streamed in chunks so the
+    similarity matrix never exceeds P x chunk."""
     top_s = torch.full((q.shape[0], k), -2.0, device=q.device, dtype=torch.half)
     top_y = torch.zeros((q.shape[0], k), device=q.device, dtype=torch.long)
     for lo in range(0, bank_f.shape[0], chunk):
@@ -118,6 +119,14 @@ def knn_scores(q, bank_f, bank_y, k, nclass, chunk=BANK_CHUNK):
         y_all = torch.cat([top_y, bank_y[lo:lo + chunk][ci]], 1)
         top_s, idx = s_all.topk(k, dim=1)
         top_y = y_all.gather(1, idx)
+    return top_s, top_y
+
+
+@torch.no_grad()
+def knn_scores(q, bank_f, bank_y, k, nclass, chunk=BANK_CHUNK):
+    """(P, nclass) similarity-weighted votes of the k nearest bank patches for queries q (P, C)
+    fp16 (``knn_topk`` with negative similarities clamped to zero before the class scatter)."""
+    top_s, top_y = knn_topk(q, bank_f, bank_y, k, chunk)
     return torch.zeros(q.shape[0], nclass, device=q.device).scatter_add_(1, top_y, top_s.float().clamp_min(0))
 
 

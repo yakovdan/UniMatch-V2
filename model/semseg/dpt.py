@@ -138,42 +138,51 @@ class DPT(nn.Module):
         # (the trainer's AdamW then applies neither an update nor weight decay to them).
         # A plain attribute, not a buffer: training-loop state, not checkpoint state.
         self.backbone_frozen = False
-        
+        # the Complementary Dropout mask the last comp_drop forward applied (None otherwise), so a
+        # second pass over the same strong views -- util/frozen_grad.py's counterfactual gradient --
+        # can reuse it through forward(..., dropout_mask=...) instead of drawing a fresh one
+        self.last_dropout_mask = None
+
     def lock_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = False
-    
-    def forward(self, x, comp_drop=False):
+
+    def sample_dropout_mask(self, bs, dim):
+        """Complementary Dropout mask (bs, dim) for the concatenated strong views (bs = 2 * n):
+        channel-wise complementary halves for the two views, with half of the pairs kept intact.
+        Draws torch's CPU RNG (Binomial sample + randperm): the training step's only main-process
+        draw, see seed_everything in unimatch_v2_1gpu.py."""
+        dropout_mask1 = self.binomial.sample((bs // 2, dim)).cuda() * 2.0
+        dropout_mask2 = 2.0 - dropout_mask1
+        dropout_prob = 0.5
+        num_kept = int(bs // 2 * (1 - dropout_prob))
+        kept_indexes = torch.randperm(bs // 2)[:num_kept]
+        dropout_mask1[kept_indexes, :] = 1.0
+        dropout_mask2[kept_indexes, :] = 1.0
+        return torch.cat((dropout_mask1, dropout_mask2))
+
+    def forward_head(self, features, patch_h, patch_w, dropout_mask=None):
+        """The DPT head on backbone features (the tuple ``get_intermediate_layers`` returns for
+        ``intermediate_layer_idx``), scaled by a Complementary Dropout mask when one is given,
+        upsampled to pixel resolution. ``forward`` ends here; util/frozen_grad.py enters here with
+        the frozen pretrained backbone's features."""
+        if dropout_mask is not None:
+            features = (feature * dropout_mask.unsqueeze(1) for feature in features)
+        out = self.head(features, patch_h, patch_w)
+        return F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+
+    def forward(self, x, comp_drop=False, dropout_mask=None):
+        """``comp_drop`` samples a fresh Complementary Dropout mask; ``dropout_mask`` applies the
+        given one instead (no RNG draw). The mask in effect is left in ``last_dropout_mask``."""
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
-        
+
         # preserve the outer context: under no_grad / eval this changes nothing
         with torch.set_grad_enabled(torch.is_grad_enabled() and not self.backbone_frozen):
             features = self.backbone.get_intermediate_layers(
                 x, self.intermediate_layer_idx[self.encoder_size]
             )
-        
-        if comp_drop:
-            bs, dim = features[0].shape[0], features[0].shape[-1]
-            
-            dropout_mask1 = self.binomial.sample((bs // 2, dim)).cuda() * 2.0
-            dropout_mask2 = 2.0 - dropout_mask1
-            dropout_prob = 0.5
-            num_kept = int(bs // 2 * (1 - dropout_prob))
-            kept_indexes = torch.randperm(bs // 2)[:num_kept]
-            dropout_mask1[kept_indexes, :] = 1.0
-            dropout_mask2[kept_indexes, :] = 1.0
-            
-            dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
-            
-            features = (feature * dropout_mask.unsqueeze(1) for feature in features)
-            
-            out = self.head(features, patch_h, patch_w)
-            
-            out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
-            
-            return out
-        
-        out = self.head(features, patch_h, patch_w)
-        out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
-        
-        return out
+
+        if comp_drop and dropout_mask is None:
+            dropout_mask = self.sample_dropout_mask(features[0].shape[0], features[0].shape[-1])
+        self.last_dropout_mask = dropout_mask
+        return self.forward_head(features, patch_h, patch_w, dropout_mask)
