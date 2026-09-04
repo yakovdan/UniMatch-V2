@@ -515,7 +515,11 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
     is given it receives ``abstain_ratio`` (disputed fraction of the counted pixels,
     mean of the two views) and, against the unlabeled GT on the confident pixels of the
     unmixed weak view, ``teacher_acc``, ``referee_acc`` and ``agree_acc`` (teacher
-    accuracy on the agreed subset). Nothing is written to ``stats`` when no referee ran.
+    accuracy on the agreed subset) -- NaN while no pixel is confident -- plus
+    ``referee_acc_all``, the referee's accuracy over every non-ignore pixel of the weak
+    view regardless of teacher confidence (defined from step 0; the referee's quality on
+    the full pixel distribution, including the hard pixels the confident set excludes).
+    Nothing is written to ``stats`` when no referee ran.
 
     Returns:
         ``(loss_u_s, mask_ratio)`` -- the unscaled unsupervised loss (0-dim tensor)
@@ -571,6 +575,9 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
             stats['teacher_acc'] = t_right.sum().item() / n_ok if n_ok else float('nan')
             stats['referee_acc'] = ((mb.ref_u_w == mb.mask_u_gt) & ok).sum().item() / n_ok if n_ok else float('nan')
             stats['agree_acc'] = (t_right & agree_w).sum().item() / n_agree if n_agree else float('nan')
+            gt_ok = mb.mask_u_gt != 255
+            n_gt = gt_ok.sum().item()
+            stats['referee_acc_all'] = ((mb.ref_u_w == mb.mask_u_gt) & gt_ok).sum().item() / n_gt if n_gt else float('nan')
     return loss_u_s, mask_ratio
 
 
@@ -1104,7 +1111,7 @@ def main():
                 logger.info('abstention gating off at optimizer step %d (epoch %d, step %d): usual pseudo-label loss from here'
                             % (iters, epoch, step))
             abstention_was_active = abstention_active
-            group_abst = np.zeros(4)  # abstain_ratio, teacher_acc, referee_acc, agree_acc
+            group_abst = np.zeros(5)  # abstain_ratio, teacher_acc, referee_acc, agree_acc, referee_acc_all
 
             for _ in range(accum):
                 # forwards and backwards of one micro-batch; gradients land in .grad
@@ -1120,8 +1127,8 @@ def main():
                 group_loss_x += r.loss_x / accum
                 group_loss_s += r.loss_s / accum
                 if abstention_active:
-                    group_abst += np.array([abst['abstain_ratio'], abst['teacher_acc'],
-                                            abst['referee_acc'], abst['agree_acc']]) / accum
+                    group_abst += np.array([abst['abstain_ratio'], abst['teacher_acc'], abst['referee_acc'],
+                                            abst['agree_acc'], abst['referee_acc_all']]) / accum
 
                 total_loss.update(r.loss)
                 total_loss_x.update(r.loss_x)
@@ -1233,7 +1240,8 @@ def main():
                 # only when the feature is on, so existing runs' metric sets are unchanged
                 **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {}),
                 **({'train/abstain_ratio': group_abst[0], 'train/teacher_acc': group_abst[1],
-                    'train/referee_acc': group_abst[2], 'train/agree_acc': group_abst[3]} if abstention_active else {})
+                    'train/referee_acc': group_abst[2], 'train/agree_acc': group_abst[3],
+                    'train/referee_acc_all': group_abst[4]} if abstention_active else {})
             })
 
             if step % max(steps_per_epoch // 8, 1) == 0:
@@ -1241,8 +1249,8 @@ def main():
                             '{:.3f}'.format(step, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg,
                                             total_loss_s.avg, total_mask_ratio.avg))
                 if abstention_active:
-                    logger.info('  abstention: disputed {:.3f} of counted pixels | acc vs unlabeled GT: teacher {:.3f}, '
-                                'referee {:.3f}, agreed {:.3f}'.format(*group_abst))
+                    logger.info('  abstention: disputed {:.3f} of counted pixels | acc vs unlabeled GT on confident pixels: '
+                                'teacher {:.3f}, referee {:.3f}, agreed {:.3f} | referee on all pixels {:.3f}'.format(*group_abst))
 
             # smoke-test throughput: the clock starts once the epoch's warm-up steps are
             # done and is read at the stop below; a stop earlier than that prints no timing

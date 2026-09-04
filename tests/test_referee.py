@@ -421,7 +421,7 @@ def test_stats_are_written_only_when_a_referee_ran():
     assert stats == {}
     stats = {}
     unsup_forward_backward(model, synth_mb(1, ref=lambda m: (m + 1) % NCLASS), crit, 0.5, 4, False, False, stats=stats)
-    assert set(stats) == {'abstain_ratio', 'teacher_acc', 'referee_acc', 'agree_acc'}
+    assert set(stats) == {'abstain_ratio', 'teacher_acc', 'referee_acc', 'agree_acc', 'referee_acc_all'}
     # sup_only: zero stub, nothing written
     stats = {}
     loss, ratio = unsup_forward_backward(model, MicroBatch(torch.zeros(1, device='cuda'), torch.zeros(1, device='cuda')),
@@ -471,6 +471,27 @@ def test_accuracy_diagnostics_against_the_unlabeled_gt():
     stats = {}
     unsup_forward_backward(model, mb, crit, 0.5, 4, False, False, stats=stats)
     assert stats['teacher_acc'] == pytest.approx(1.0) and stats['referee_acc'] == pytest.approx(1.0)
+    assert stats['referee_acc_all'] == pytest.approx(1.0)      # referee == gt on every non-ignore pixel
+
+
+@pytest_cuda
+def test_referee_acc_all_is_defined_without_confident_pixels_and_ignores_the_mask():
+    crit = nn.CrossEntropyLoss(reduction='none').cuda(); model = ToyStudent().cuda()
+    conf = torch.zeros(B, H, W)                       # teacher confident nowhere -> confident-set accs are NaN
+    mb0 = synth_mb(11, conf=conf)
+    gt = mb0.mask_u_w.cpu().clone()                   # gt == teacher label everywhere
+    def ref(m):
+        r = m.clone(); r[:, :H // 4] = (m[:, :H // 4] + 1) % NCLASS; return r   # referee wrong on the top quarter
+    stats = {}
+    unsup_forward_backward(model, synth_mb(11, ref=ref, conf=conf, gt=gt), crit, 0.5, 4, False, False, stats=stats)
+    assert math.isnan(stats['teacher_acc']) and math.isnan(stats['referee_acc']) and math.isnan(stats['agree_acc'])
+    assert stats['abstain_ratio'] == 0.0
+    assert stats['referee_acc_all'] == pytest.approx(0.75)
+    # ignore pixels in the gt are excluded from the denominator
+    gt2 = gt.clone(); gt2[:, :H // 4] = 255
+    stats = {}
+    unsup_forward_backward(model, synth_mb(11, ref=ref, conf=conf, gt=gt2), crit, 0.5, 4, False, False, stats=stats)
+    assert stats['referee_acc_all'] == pytest.approx(1.0)
 
 
 @pytest_cuda
