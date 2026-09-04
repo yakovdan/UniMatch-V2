@@ -102,6 +102,42 @@ def test_adamw_accumulate_only_warms_moments_without_moving_params():
     sd = opt.state_dict(); assert sd['param_groups'][0]['accumulate_only'] is False
 
 
+def test_ema_update_formula_and_skipping():
+    from unimatch_v2_1gpu import ema_update
+    torch.manual_seed(0)
+    src = [torch.randn(7), torch.randn(3, 4)]
+    dst = [torch.randn(7), torch.randn(3, 4)]
+    before = [d.clone() for d in dst]
+    ema_update(list(zip(src, dst)), 0.9)
+    for s, d, b in zip(src, dst, before):
+        torch.testing.assert_close(d, b * 0.9 + s * 0.1)
+    # a pair that is not passed is not touched, bitwise
+    skipped = torch.randn(5); skipped0 = skipped.clone()
+    ema_update([(torch.randn(7), dst[0])], 0.5)   # updates dst[0] only
+    assert torch.equal(skipped, skipped0)
+
+
+def test_locked_backbone_teacher_stays_bitwise_at_the_checkpoint():
+    # the point of skipping: x*r + x*(1-r) in fp32 is not always x, so an EMA that keeps
+    # "updating" a frozen backbone lets the teacher drift from the student by rounding
+    from unimatch_v2_1gpu import ema_update
+    torch.manual_seed(0)
+    student_bb = torch.randn(200_000)          # frozen: never changes
+    teacher_bb = student_bb.clone()
+    student_head, teacher_head = torch.randn(1000), torch.randn(1000)
+    teacher_head0 = teacher_head.clone()
+    ratio, n = 0.996, 300
+    drifting = teacher_bb.clone()
+    for _ in range(n):
+        ema_update([(student_head, teacher_head)], ratio)          # what the trainer does while locked
+        ema_update([(student_bb, drifting)], ratio)               # what it used to do
+    assert torch.equal(teacher_bb, student_bb)                    # skipped pairs: exact, by construction
+    n_drift = (drifting != student_bb).sum().item()
+    print('elements drifted by rounding after %d EMA steps of a constant: %d of %d' % (n, n_drift, drifting.numel()))
+    # the head kept moving toward the student: closed form dst0 * r^n + src * (1 - r^n)
+    torch.testing.assert_close(teacher_head, teacher_head0 * ratio ** n + student_head * (1 - ratio ** n), rtol=1e-4, atol=1e-5)
+
+
 def test_env_override_and_validation(monkeypatch):
     args = parser.parse_args(REQUIRED)
     assert args.unlock_after == 0

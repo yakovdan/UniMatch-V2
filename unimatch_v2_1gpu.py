@@ -23,6 +23,7 @@ from supervised import evaluate
 from util.classes import CLASSES
 from util.ggr import rectify as ggr_rectify
 from util.ohem import ProbOhemCrossEntropy2d
+from util.referee import KNNReferee, abstention_loss_px
 from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 
@@ -79,6 +80,15 @@ parser.add_argument('--unlock-accumulate', action='store_true',
                          'step rather than the sign-like step an empty state produces. Costs the backbone '
                          'backward during the lock; grad/* and GGR see the (unapplied) backbone gradient '
                          '[env: UNLOCK_ACCUMULATE]')
+parser.add_argument('--abstention', action='store_true',
+                    help='gate the unsupervised loss with a second labeler for the whole run, independent '
+                         'of the backbone lock: a k-NN referee on frozen pretrained DINOv2 patch features '
+                         '(bank = the labeled images of the split, util/referee.py) labels the weak view '
+                         'alongside the teacher. Confident pixels where the two agree take the usual CE; '
+                         'where they disagree the abstention loss pushes down every class except the two '
+                         'candidates and takes no side between them. Logs train/abstain_ratio and '
+                         'teacher/referee/agreed accuracy against the unlabeled GT. Combines freely with '
+                         '--unlock-after / --unlock-accumulate; incompatible with --sup-only [env: ABSTENTION]')
 parser.add_argument('--sup-only', action='store_true',
                     help='supervised baseline: skip the teacher forward, CutMix, the strong-view student '
                          'forward and the unsupervised loss/backward. The labeled stream, loss scaling, '
@@ -182,6 +192,16 @@ def boolean(raw):
         return False
     raise ValueError
 
+def ema_update(pairs, ratio):
+    """Teacher <- ratio * teacher + (1 - ratio) * student, in place, over (student, teacher)
+    tensor pairs. The caller chooses the pairs: while the backbone is locked by any mechanism
+    (--lock-backbone, or the lock window of --unlock-after in either mode) the backbone pairs
+    are left out, so the teacher backbone stays bitwise at the checkpoint instead of drifting
+    by rounding through x*r + x*(1-r), which fp32 does not always return as x."""
+    for src, dst in pairs:
+        dst.copy_(dst * ratio + src.detach() * (1 - ratio))
+
+
 def check_unlock_after(args, cfg):
     """Validate --unlock-after against the effective config (after the lock_backbone override).
 
@@ -193,6 +213,8 @@ def check_unlock_after(args, cfg):
         raise ValueError('--unlock-after needs a trainable backbone; drop --lock-backbone / lock_backbone: True')
     if args.unlock_accumulate and args.unlock_after <= 0:
         raise ValueError('--unlock-accumulate only applies together with --unlock-after N > 0')
+    if args.abstention and args.sup_only:
+        raise ValueError('--abstention has no unsupervised loss to gate under --sup-only')
 
 def pairwise_cos(rows, idx, n_cls):
     """(n_cls, n_cls) fp32 matrix of pairwise cosines between the per-class gradient
@@ -314,6 +336,7 @@ ENV_OVERRIDES = (
     ('LOCK_BACKBONE', 'lock_backbone', boolean, None),
     ('UNLOCK_AFTER', 'unlock_after', int, None),
     ('UNLOCK_ACCUMULATE', 'unlock_accumulate', boolean, None),
+    ('ABSTENTION', 'abstention', boolean, None),
     ('LR', 'lr', float, None),
     ('LR_MULTI', 'lr_multi', float, None),
     ('SEED', 'seed', int, None),
@@ -413,6 +436,7 @@ class MicroBatch(NamedTuple):
     cutmix_box1: Optional[torch.Tensor] = None
     cutmix_box2: Optional[torch.Tensor] = None
     mask_u_gt: Optional[torch.Tensor] = None  # GT of the unlabeled batch; not used by the loss yet
+    ref_u_w: Optional[torch.Tensor] = None    # k-NN referee label on the weak view (--abstention)
 
 
 def cutmix_(img, box):
@@ -424,12 +448,16 @@ def cutmix_(img, box):
     img[sel] = img.flip(0)[sel]
 
 
-def load_micro_batch(loader, model_ema, sup_only, bf16):
+def load_micro_batch(loader, model_ema, sup_only, bf16, referee=None):
     """Pull the next micro-batch off `loader` and prepare what the student step
     consumes: every tensor on the GPU, the teacher's (EMA model) pseudo-label and
     confidence on the weak view, and CutMix applied to the two strong views. Under
     --sup-only the loader yields only the labeled pair. Draws from no RNG: the
-    teacher runs in eval mode without Complementary Dropout."""
+    teacher runs in eval mode without Complementary Dropout.
+
+    With a ``referee`` (util.referee.KNNReferee; --abstention) its label map on the
+    same weak view is returned as ``ref_u_w``, so the unsupervised loss can compare
+    the two labelers pixel by pixel."""
     if sup_only:
         img_x, mask_x = next(loader)
         return MicroBatch(img_x.cuda(), mask_x.cuda())
@@ -442,14 +470,15 @@ def load_micro_batch(loader, model_ema, sup_only, bf16):
         pred_u_w = model_ema(img_u_w)
         conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
         mask_u_w = pred_u_w.argmax(dim=1)
+        ref_u_w = referee.predict(img_u_w) if referee is not None else None
 
     cutmix_(img_u_s1, cutmix_box1)
     cutmix_(img_u_s2, cutmix_box2)
     return MicroBatch(img_x.cuda(), mask_x.cuda(), img_u_s1, img_u_s2, mask_u_w, conf_u_w,
-                      ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt)
+                      ignore_mask, cutmix_box1, cutmix_box2, mask_u_gt, ref_u_w)
 
 
-def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16):
+def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16, stats=None):
     """The unsupervised half of one micro-batch: the student's forward on the two
     strong views, the confidence-masked consistency loss against the teacher's
     pseudo-label, and its backward. The loss, scaled by 1/(2*accum) like the
@@ -472,6 +501,18 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
     sees is exactly zero. The caller keeps the (loss_x + loss_u_s) / 2 form so
     train/loss_all and the applied gradient scale match the semi-supervised runs.
 
+    Abstention gating (``mb.ref_u_w`` is set, i.e. --abstention; independent of the
+    backbone lock): the referee's label map on the weak view is CutMixed with the same boxes,
+    and among the confident non-padding pixels those where teacher and referee agree
+    take the per-pixel CE above while those where they disagree take
+    util.referee.abstention_loss_px -- push down every class but the two candidates,
+    no opinion between them. The confidence mask and the ALL-non-padding denominator
+    are unchanged, so the loss scale matches the ungated runs. When ``stats`` (a dict)
+    is given it receives ``abstain_ratio`` (disputed fraction of the counted pixels,
+    mean of the two views) and, against the unlabeled GT on the confident pixels of the
+    unmixed weak view, ``teacher_acc``, ``referee_acc`` and ``agree_acc`` (teacher
+    accuracy on the agreed subset). Nothing is written to ``stats`` when no referee ran.
+
     Returns:
         ``(loss_u_s, mask_ratio)`` -- the unscaled unsupervised loss (0-dim tensor)
         and the fraction of non-padding pixels of the unmixed weak view whose
@@ -484,29 +525,48 @@ def unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only,
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
         pred_u_s1, pred_u_s2 = model(torch.cat((mb.img_u_s1, mb.img_u_s2)), comp_drop=True).chunk(2)
 
-    mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
-    mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = mb.mask_u_w.clone(), mb.conf_u_w.clone(), mb.ignore_mask.clone()
+    gated = mb.ref_u_w is not None
 
-    mask_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box1 == 1]
-    conf_u_w_cutmixed1[mb.cutmix_box1 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box1 == 1]
-    ignore_mask_cutmixed1[mb.cutmix_box1 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box1 == 1]
+    def cutmixed(box):
+        """The teacher's pseudo-label, confidence, ignore mask (and referee label) mixed with `box`."""
+        sel = box == 1
+        outs = []
+        for src in (mb.mask_u_w, mb.conf_u_w, mb.ignore_mask) + ((mb.ref_u_w,) if gated else ()):
+            dst = src.clone()
+            dst[sel] = src.flip(0)[sel]
+            outs.append(dst)
+        return outs
 
-    mask_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.mask_u_w.flip(0)[mb.cutmix_box2 == 1]
-    conf_u_w_cutmixed2[mb.cutmix_box2 == 1] = mb.conf_u_w.flip(0)[mb.cutmix_box2 == 1]
-    ignore_mask_cutmixed2[mb.cutmix_box2 == 1] = mb.ignore_mask.flip(0)[mb.cutmix_box2 == 1]
+    def view_loss(pred, mixed):
+        mask_cm, conf_cm, ign_cm = mixed[:3]
+        valid = (conf_cm >= conf_thresh) & (ign_cm != 255)
+        loss_px = criterion_u(pred, mask_cm)
+        if gated:
+            agree = mask_cm == mixed[3]
+            loss_px = torch.where(agree, loss_px, abstention_loss_px(pred, mask_cm, mixed[3]))
+            n_valid = valid.sum().item()
+            disputed.append((valid & ~agree).sum().item() / max(n_valid, 1))
+        return (loss_px * valid).sum() / (ign_cm != 255).sum().item()
 
+    disputed = []
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
-        loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-        loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= conf_thresh) & (ignore_mask_cutmixed1 != 255))
-        loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
-
-        loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-        loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= conf_thresh) & (ignore_mask_cutmixed2 != 255))
-        loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
-
+        loss_u_s1 = view_loss(pred_u_s1, cutmixed(mb.cutmix_box1))
+        loss_u_s2 = view_loss(pred_u_s2, cutmixed(mb.cutmix_box2))
         loss_u_s = (loss_u_s1 + loss_u_s2) / 2.0
     (loss_u_s / (2.0 * accum)).backward()
     mask_ratio = ((mb.conf_u_w >= conf_thresh) & (mb.ignore_mask != 255)).sum().item() / (mb.ignore_mask != 255).sum().item()
+
+    if gated and stats is not None:
+        # labeler quality on the unmixed weak view, where the unlabeled GT lines up with both maps
+        with torch.no_grad():
+            ok = (mb.conf_u_w >= conf_thresh) & (mb.ignore_mask != 255) & (mb.mask_u_gt != 255)
+            t_right = (mb.mask_u_w == mb.mask_u_gt) & ok
+            agree_w = (mb.mask_u_w == mb.ref_u_w) & ok
+            n_ok, n_agree = ok.sum().item(), agree_w.sum().item()
+            stats['abstain_ratio'] = sum(disputed) / len(disputed)
+            stats['teacher_acc'] = t_right.sum().item() / n_ok if n_ok else float('nan')
+            stats['referee_acc'] = ((mb.ref_u_w == mb.mask_u_gt) & ok).sum().item() / n_ok if n_ok else float('nan')
+            stats['agree_acc'] = (t_right & agree_w).sum().item() / n_agree if n_agree else float('nan')
     return loss_u_s, mask_ratio
 
 
@@ -516,11 +576,14 @@ class MicroBatchLosses(NamedTuple):
     loss_x: float      # supervised loss, unscaled
     loss_s: float      # unsupervised loss, unscaled (0 under --sup-only)
     mask_ratio: float  # confident fraction of the weak view's non-padding pixels (0 under --sup-only)
+    # the --abstention diagnostics travel in the caller's `stats` dict (see unsup_forward_backward),
+    # so this record keeps its four fields and stays comparable to the pre-refactor tuple
 
 
 def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                       accum, conf_thresh, sup_only, bf16,
-                      anchor_params=None, proto_acc=None, proto_cnt=None, proto_px=None):
+                      anchor_params=None, proto_acc=None, proto_cnt=None, proto_px=None, referee=None,
+                      stats=None):
     """One micro-batch of an optimizer step: load and prepare it (load_micro_batch),
     the labeled forward and loss, the per-class anchor gradients when prototypes are
     tracked, the supervised backward, then the unsupervised half
@@ -538,12 +601,15 @@ def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params
 
     Per-class gradients are accumulated iff ``proto_acc`` is given (--ggr-anchor
     class or --log-class-cos); ``anchor_params`` and ``proto_cnt`` go with it, and
-    ``proto_px`` (optional) receives the per-class labeled pixel counts.
+    ``proto_px`` (optional) receives the per-class labeled pixel counts. A ``referee``
+    (--abstention) labels the weak view too and gates the unsupervised loss; its
+    diagnostics are written into ``stats`` when that dict is given (see
+    unsup_forward_backward).
 
     Returns the micro-batch's losses (MicroBatchLosses). The gradients are left in
     .grad and ``grad_x_acc``; the prototype accumulators are updated in place.
     """
-    mb = load_micro_batch(loader, model_ema, sup_only, bf16)
+    mb = load_micro_batch(loader, model_ema, sup_only, bf16, referee)
 
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
         pred_x = model(mb.img_x)
@@ -562,7 +628,8 @@ def train_micro_batch(loader, model, model_ema, criterion_l, criterion_u, params
 
     # the unsupervised half backwards into the same .grad, on top of the supervised
     # gradient just accumulated there (zero stub under --sup-only)
-    loss_u_s, mask_ratio = unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16)
+    loss_u_s, mask_ratio = unsup_forward_backward(model, mb, criterion_u, conf_thresh, accum, sup_only, bf16,
+                                                  stats=stats)
 
     loss = (loss_x.detach() + loss_u_s.detach()) / 2.0
     return MicroBatchLosses(loss.item(), loss_x.item(), loss_u_s.item(), mask_ratio)
@@ -695,6 +762,25 @@ def main():
     model_ema.eval()
     for param in model_ema.parameters():
         param.requires_grad = False
+
+    # --abstention: the k-NN referee on the frozen pretrained trunk. Built AFTER the DPT (its
+    # DINOv2 construction draws from torch's RNG before the checkpoint overwrites the weights;
+    # doing it earlier would change the head init and break every seed pairing) and before the
+    # epoch loop, whose per-epoch reseeding covers everything that follows. Absent the flag,
+    # nothing here runs and the run is byte-identical to one without it.
+    referee = None
+    if args.abstention:
+        referee = KNNReferee.from_pretrained(
+            cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth', args.labeled_id_path,
+            cfg['data_root'], cfg['dataset'], cfg['nclass'], logger=logger)
+
+    # (student, teacher) pairs for the EMA update, with and without the backbone (see ema_update).
+    # Membership by identity rather than by position in model.parameters().
+    ema_pairs_all = list(zip(model.parameters(), model_ema.parameters()))
+    ema_bufs_all = list(zip(model.buffers(), model_ema.buffers()))
+    _bb = {id(t) for t in model.backbone.parameters()} | {id(t) for t in model.backbone.buffers()}
+    ema_pairs_head = [(s, t) for s, t in ema_pairs_all if id(s) not in _bb]
+    ema_bufs_head = [(s, t) for s, t in ema_bufs_all if id(s) not in _bb]
 
     if cfg['criterion']['name'] == 'CELoss':
         criterion_l = nn.CrossEntropyLoss(**cfg['criterion']['kwargs']).cuda()
@@ -848,6 +934,9 @@ def main():
         logger.info('backbone locked for the first %d of %d optimizer steps: the DINOv2 weights receive no '
                     'gradient and no weight decay until then, and their Adam state starts at the unlock\n'
                     % (args.unlock_after, total_steps))
+    if args.abstention:
+        logger.info('abstention gating active for the whole run (independent of the backbone lock): confident '
+                    'unlabeled pixels where teacher and referee agree take CE, disputed ones the abstention loss\n')
     if class_anchor or args.log_class_cos:
         # Per-class supervised gradients live in the surgery-scope space: under
         # --ggr-scope head (the protocol default) that is the DPT head, laid out like
@@ -1001,19 +1090,27 @@ def main():
             flat_s.zero_()
 
             group_loss, group_loss_x, group_loss_s = 0.0, 0.0, 0.0
+            # --abstention: the referee labels the weak view and gates the unsupervised loss for the
+            # whole run, independent of the backbone lock
+            abstention_active = args.abstention
+            group_abst = np.zeros(4)  # abstain_ratio, teacher_acc, referee_acc, agree_acc
 
             for _ in range(accum):
                 # forwards and backwards of one micro-batch; gradients land in .grad
                 # and grad_x_acc, the per-class accumulators (if any) are updated
+                abst = {}
                 r = train_micro_batch(
                     loader, model, model_ema, criterion_l, criterion_u, params, grad_x_acc,
                     accum, cfg['conf_thresh'], args.sup_only, args.bf16,
                     anchor_params=anchor_params, proto_acc=proto_acc, proto_cnt=proto_cnt,
-                    proto_px=proto_px)
+                    proto_px=proto_px, referee=referee if abstention_active else None, stats=abst)
 
                 group_loss += r.loss / accum
                 group_loss_x += r.loss_x / accum
                 group_loss_s += r.loss_s / accum
+                if abstention_active:
+                    group_abst += np.array([abst['abstain_ratio'], abst['teacher_acc'],
+                                            abst['referee_acc'], abst['agree_acc']]) / accum
 
                 total_loss.update(r.loss)
                 total_loss_x.update(r.loss_x)
@@ -1104,10 +1201,11 @@ def main():
 
             ema_ratio = min(1 - 1 / (iters + 1), 0.996)
 
-            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
-                param_ema.copy_(param_ema * ema_ratio + param.detach() * (1 - ema_ratio))
-            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
-                buffer_ema.copy_(buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio))
+            # a locked backbone (either mechanism) is skipped: student and teacher trunks are
+            # both the checkpoint, and the EMA of a constant should stay bitwise that constant
+            backbone_frozen_now = cfg['lock_backbone'] or backbone_locked
+            ema_update(ema_pairs_head if backbone_frozen_now else ema_pairs_all, ema_ratio)
+            ema_update(ema_bufs_head if backbone_frozen_now else ema_bufs_all, ema_ratio)
 
             wandb.log({
                 'train/loss_all': group_loss,
@@ -1122,13 +1220,18 @@ def main():
                 'iters': iters,
                 **ggr_stats,
                 # only when the feature is on, so existing runs' metric sets are unchanged
-                **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {})
+                **({'train/backbone_locked': float(backbone_locked)} if args.unlock_after > 0 else {}),
+                **({'train/abstain_ratio': group_abst[0], 'train/teacher_acc': group_abst[1],
+                    'train/referee_acc': group_abst[2], 'train/agree_acc': group_abst[3]} if abstention_active else {})
             })
 
             if step % max(steps_per_epoch // 8, 1) == 0:
                 logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Mask ratio: '
                             '{:.3f}'.format(step, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg,
                                             total_loss_s.avg, total_mask_ratio.avg))
+                if abstention_active:
+                    logger.info('  abstention: disputed {:.3f} of counted pixels | acc vs unlabeled GT: teacher {:.3f}, '
+                                'referee {:.3f}, agreed {:.3f}'.format(*group_abst))
 
             # smoke-test throughput: the clock starts once the epoch's warm-up steps are
             # done and is read at the stop below; a stop earlier than that prints no timing

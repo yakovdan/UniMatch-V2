@@ -181,7 +181,9 @@ def test_semi_matches_reference(seed, bf16):
     got = load_micro_batch(iter([copy.deepcopy(batch)]), toy_teacher(seed), sup_only=False, bf16=bf16)
     want = reference_block(iter([copy.deepcopy(batch)]), toy_teacher(seed), sup_only=False, bf16=bf16)
     assert_same_micro_batch(got, want)
-    assert all(getattr(got, f).is_cuda for f in MicroBatch._fields)
+    # every field is a CUDA tensor except the referee label, which is None without --abstention
+    assert all(getattr(got, f).is_cuda for f in MicroBatch._fields if f != 'ref_u_w')
+    assert got.ref_u_w is None
 
 
 # ----------------------------------------------------------------------------
