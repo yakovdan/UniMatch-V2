@@ -138,3 +138,206 @@ collapse-mechanism work on split 92 (`seed_attribution_experiment/notes.md`, the
 audit and the OSR/VLR rows) draws the same line from the other side: substitution (cat
 relabelled as dog) responds to OSR-class, absorption into background (bicycle, tv/monitor)
 responds to VLR-class.
+
+## Frozen DINOv2 as a head-free classifier: k-NN and class-mean probes
+
+Measured 2026-09-03 (session 15:37Z to 17:10Z) to answer: do the pretrained features tell
+sofa from chair when the fine-tuned split-92 model does not? Code: `feature_probe.py` (repo
+root, untracked); saved confusion matrices: `analysis_outputs/feature_probe_layer11.npz`.
+The head swap that motivated it is `head_swap.py` with
+`analysis_outputs/head_swap_seed12000_92.npz`. The per-class table reproduces without GPU
+work via
+
+```
+python feature_probe.py --report-npz analysis_outputs/feature_probe_layer11.npz --clf knn --classes
+```
+
+### Setup
+
+- **Trunks.** Pretrained DINOv2-S; "merged" = trunk of `92_60ep_none_seed12000`
+  `best_ema.pth` (sofa/chair merged, sofa 34.2 / chair 28.5); "separated" = trunk of
+  `92_20ep_none_seed12000` `best_ema.pth` (same seed, compressed 20-epoch schedule, sofa 49.5
+  / chair 39.8). Each trunk is frozen and every image is run through it; features are the
+  layer-11 patch tokens (one layer, where the DPT head reads four).
+- **Bank.** Every $14 \times 14$ patch of the labeled images of one split whose block is at
+  least 75% one class contributes its feature vector and label. The 92 bank holds five sofa
+  images' worth of patches, the 1464 bank 93.
+- **k-NN.** For each val patch, the $k = 20$ bank patches with the highest cosine
+  similarity vote for their class, weighted by similarity. Uses the *local* structure of the
+  feature space.
+- **Class mean.** Average the bank patches of each class into one vector; each val patch
+  takes the class whose mean it is most similar to. Uses only the *global* geometry, and is
+  the head-free analogue of a $1 \times 1$ conv head and of the class-gradient prototypes.
+- Per-class similarity maps are upsampled bilinearly to pixel resolution and argmaxed, then
+  scored exactly like the trainer's evaluation (ignore pixels dropped). Patch-level
+  prediction carries a boundary penalty, so absolute IoUs run below the model's.
+
+### Sofa and chair under the probes
+
+| Trunk | Bank | k-NN sofa / chair | k-NN mIoU | GT sofa to chair, k-NN | GT sofa to chair, class mean |
+|---|---|---|---|---|---|
+| pretrained | 92 | 28.3 / 23.6 | 55.0 | 35% | 63% |
+| pretrained | 1464 | 53.5 / 40.0 | 72.9 | 9% | 8% |
+| merged (60-ep) | 92 | 34.9 / 27.0 | 76.2 | 48% | 49% |
+| merged (60-ep) | 1464 | 55.1 / 39.0 | 80.5 | 18% | 38% |
+| separated (20-ep) | 92 | 48.8 / 35.0 | 73.8 | 19% | 19% |
+| separated (20-ep) | 1464 | 58.7 / 41.8 | 80.2 | 11% | 15% |
+
+- **The pretrained features do separate the pair, given enough reference.** With the 1464
+  bank, raw DINOv2 k-NN reaches sofa 53.5 and chair 40.0 with 9% leakage, matching the best
+  fine-tuned run and far above the merged model's 34 / 28.5 at 50%.
+- **But not from five sofa images.** With the 92 bank the raw features give sofa 28 and 35%
+  leakage, and the class-mean classifier leaks 63%. Fine-tuning is what makes the features
+  linearly usable at 92: class-mean mIoU goes from 46 on the pretrained trunk to 75 on either
+  fine-tuned trunk. The merged basin pays for that with the pair.
+- **The head adds nothing for the pair.** k-NN on each fine-tuned trunk with the 92 bank
+  reproduces its full model: merged 34.9 / 27.0 at 48% against the model's 34.2 / 28.5 at
+  50%; separated 48.8 / 35.0 at 19% against 49.5 / 39.8 at 13.5%. The head-swap result was not
+  a head artefact.
+- **The merged trunk still holds the information locally; its class means have collapsed.**
+  With the 1464 bank, k-NN on the merged features separates the pair nearly as well as on the
+  separated trunk (55 / 39 at 18%), while the class-mean classifier on the same features leaks
+  38% against 8% pretrained and 15% separated. Every linear consumer downstream, the
+  $1 \times 1$ head and the gradient prototypes alike, reads exactly the geometry that
+  collapsed.
+
+### Scarcity versus damage: what happens when the bank grows
+
+| Trunk | class-mean leak, 92 to 1464 bank | k-NN leak, 92 to 1464 bank |
+|---|---|---|
+| pretrained | 63% to 8% | 35% to 9% |
+| separated (20-ep) | 19% to 15% | 19% to 11% |
+| merged (60-ep) | 49% to 38% | 48% to 18% |
+
+A k-NN-versus-class-mean gap is generic (k-NN wins whenever a class is multimodal or its mean
+is badly estimated), so the gap itself proves nothing; its response to more reference data
+does. **Pretrained at 92 is a mean-estimation problem**: five sofas define a bad center in a
+space with much non-semantic variance, and 93 sofas fix it completely (both classifiers
+converge at 8 to 9%). **Merged at 1464 is a geometry problem**: with the mean well estimated,
+class-mean leak stays at 38% because the two centers really are close. The merged trunk's
+local structure is also degraded (k-NN leak 18%, twice the pretrained 9% and separated 11%),
+and at the 92 bank it shows no gap at all (48% vs 49%): the five training sofas were fit as
+special cases and val sofas land near chairs under either classifier. The first is damage,
+the second is scarcity.
+
+### Per-class k-NN IoU, six scenarios
+
+Layer-11 features, $k = 20$, with the full fine-tuned models' best EMA at 92 and 1464
+labels for reference. Sorted by the pretrained-1464 column.
+
+| Class | pre-92 | pre-1464 | merged-92 | merged-1464 | sep-92 | sep-1464 | model 92 | model 1464 |
+|---|---|---|---|---|---|---|---|---|
+| background | 90.7 | 93.2 | 93.7 | 94.9 | 92.9 | 94.6 | 95.9 | 97.0 |
+| bird | 76.8 | 86.0 | 86.3 | 88.5 | 84.8 | 86.5 | 94.7 | 95.4 |
+| person | 82.9 | 85.7 | 86.2 | 88.4 | 86.6 | 88.2 | 90.0 | 92.3 |
+| bus | 72.5 | 84.8 | 91.2 | 91.8 | 90.5 | 91.9 | 95.5 | 95.7 |
+| train | 72.4 | 83.6 | 89.1 | 89.9 | 89.8 | 90.4 | 92.2 | 93.0 |
+| aeroplane | 75.2 | 82.1 | 80.3 | 83.9 | 77.3 | 82.1 | 93.1 | 91.8 |
+| cat | 45.9 | 81.8 | 93.3 | 93.0 | 91.7 | 92.4 | 96.6 | 96.8 |
+| dog | 50.6 | 80.1 | 90.5 | 91.6 | 88.6 | 91.0 | 94.5 | 95.2 |
+| car | 71.1 | 79.9 | 86.1 | 87.0 | 85.8 | 87.5 | 89.5 | 90.4 |
+| motorbike | 61.2 | 78.8 | 82.6 | 86.0 | 74.9 | 85.0 | 89.0 | 93.0 |
+| bottle | 58.7 | 74.9 | 80.8 | 81.8 | 80.4 | 80.6 | 83.8 | 87.8 |
+| horse | 53.8 | 74.9 | 85.9 | 88.3 | 83.3 | 86.6 | 94.5 | 95.1 |
+| boat | 66.2 | 72.8 | 77.2 | 78.5 | 72.9 | 76.9 | 83.2 | 86.2 |
+| sheep | 51.2 | 72.3 | 85.1 | 86.7 | 80.4 | 85.8 | 92.5 | 94.9 |
+| cow | 35.9 | 70.9 | 90.3 | 91.3 | 88.7 | 90.4 | 96.3 | 96.5 |
+| tv/monitor | 51.0 | 70.2 | 68.6 | 75.2 | 66.6 | 74.8 | 71.4 | 85.4 |
+| dining table | 47.0 | 59.5 | 63.3 | 73.7 | 67.7 | 73.2 | 66.7 | 77.7 |
+| bicycle | 0.5 | 53.6 | 43.9 | 63.6 | 2.6 | 61.6 | 80.2 | 80.1 |
+| sofa | 28.3 | 53.5 | 34.9 | 55.1 | 48.8 | 58.7 | 34.1 | 68.0 |
+| potted plant | 40.5 | 52.4 | 64.5 | 63.3 | 60.7 | 63.3 | 68.8 | 73.7 |
+| chair | 23.6 | 40.0 | 27.0 | 39.0 | 35.0 | 41.8 | 28.5 | 55.8 |
+| **mIoU** | **55.0** | **72.9** | **76.2** | **80.5** | **73.8** | **80.2** | 82.4 | 87.7 |
+
+| | mIoU over 21 classes | mIoU over 20 classes, bicycle dropped |
+|---|---|---|
+| pretrained k-NN, 92 bank | 55.0 | 57.8 |
+| pretrained k-NN, 1464 bank | 72.9 | 73.9 |
+| merged k-NN, 92 bank | 76.2 | 77.8 |
+| separated k-NN, 92 bank | 73.8 | 77.4 |
+
+- **Fine-tuning organizes the features for almost everything.** Raw DINOv2 with five to
+  fifteen reference images fails on cat 45.9, cow 35.9, dog 50.6, sheep 51.2; either
+  fine-tuned trunk puts them at 85 to 93 from the same 92 references. Growing the bank from 92
+  to 1464 is worth +17.9 mIoU on the pretrained trunk but only +4.3 and +6.3 on the fine-tuned
+  ones.
+- **The merged trunk is the better trunk on 20 of 21 classes** against pretrained at the
+  1464 bank (it loses only chair, by 1.1, and its sofa 55.1 beats pretrained 53.5). What the
+  merged basin did is improve every class except the pair, collapse the pair's class means,
+  and make the five training sofas useless as references (34.9 against the separated trunk's
+  48.8 at the 92 bank).
+- **Against the separated trunk it is a different trade-off, not a worse trunk.** At 92
+  references it trails on sofa by 13.9 and chair by 8.0, and leads on bicycle, motorbike,
+  aeroplane and potted plant by 4 to 41; overall 76.2 against 73.8, full models 82.4 against
+  82.8.
+- **The head adds nothing for the pair and a lot for thin classes.** Model-92 minus
+  merged-92 is 0 on sofa and 1.5 on chair, against +36 on bicycle, +13 on aeroplane, +9 on
+  horse. Bicycle's near-zero probe scores at the 92 bank (0.5 pretrained, 2.6 separated) are a
+  purity artefact: thin frames leave almost no 75%-pure $14 \times 14$ blocks. Aeroplane is
+  not that: its k-NN score barely moves with references and sits about 10 under the model at
+  both bank sizes, which fits patch-resolution loss on wing edges, tails and landing gear that
+  the four-layer DPT head recovers (horse and sheep show the same shape). Likely, not verified
+  with a trimap.
+- **tv/monitor and dining table are reference-limited, sofa and chair are trunk-limited.**
+  With the 1464 bank the merged trunk's own features reach tv 75.2 and table 73.7, above what
+  the 92-trained head extracts from them (71.4, 66.7). For sofa and chair the 1464 bank on the
+  merged trunk gives 55 and 39, still well short of the 1464-trained model's 68 and 56. More
+  references cannot get the 92 trunk there; only a different trunk can.
+
+### Context: the merge lives in the trunk
+
+Head swap between the merged and separated checkpoints (seed 12000, split 92, Pascal val):
+
+| Trunk | Head | sofa | chair | table | mIoU | GT sofa to chair |
+|---|---|---|---|---|---|---|
+| merged | merged | 34.2 | 28.5 | 66.7 | 82.42 | 50.0% |
+| merged | separated | 36.7 | 29.5 | 65.6 | 81.98 | 44.5% |
+| separated | merged | 48.6 | 34.6 | 71.9 | 82.97 | 24.1% |
+| separated | separated | 49.5 | 39.8 | 70.6 | 82.75 | 13.5% |
+
+Giving the merged trunk the good head recovers 2.5 points of sofa; giving the good trunk the
+merged head recovers 14.4 and cuts the leak from 50% to 24%. Same pattern as
+`head_vs_trunk.md` found for the cat collapse.
+
+Frozen-trunk training runs (`--lock-backbone`, seed 12000, split 92, epoch 19 of the
+60-epoch schedule) then showed the merge needs a trainable trunk:
+
+| Run | sofa | chair | cat | mIoU |
+|---|---|---|---|---|
+| trunk frozen, semi-supervised | 51.1 | 32.2 | 95.8 | 81.8 |
+| trunk frozen, sup-only | 30.9 | 21.0 | 87.9 | 68.0 |
+| trunk trainable, semi-supervised (60-ep run at ep 19) | 26.5 | 27.3 | 94.9 | 81.2 |
+| trunk trainable, sup-only | 28.9 | 23.8 | 78.2 | 64.9 |
+
+Sofa under the frozen trunk with unlabeled data rises monotonically 34, 40, 42, 43, 46, 48,
+51 while the same seed with a trainable trunk falls to 26. The frozen trunk costs 6 mIoU at
+epoch 0 (60.8 vs 66.8), is ahead by epoch 5 (79.5 vs 77.8) and finishes 20 epochs slightly
+ahead. The frozen sup-only run stays flat near 31: labeled data alone cannot teach sofa even
+when it cannot damage the trunk. One seed; the 60-epoch ceiling of a frozen trunk is
+unmeasured.
+
+### Pretrained k-NN as a labeler
+
+| Labeler at split 92 | mIoU on val | Training steps spent |
+|---|---|---|
+| pretrained DINOv2 k-NN, 92-image bank | 55.0 | 0 |
+| model (any arm) after epoch 0 | 66.8 to 67.6 | 655 |
+| model after epoch 1 | 70 to 73 | 1310 |
+
+The frozen k-NN is not better than the trained model; it is better than what the pipeline
+has during epoch 0, when the mask ratio climbs from 0 to 0.56 on a teacher that started as
+a random head a few hundred steps earlier. That window is also where the sofa/chair basin and
+the cat collapse are decided. Its ceiling arrives within one epoch, its patches are blobby
+(bicycle 0.5), and its per-class unevenness at the 92 bank (cat 45.9, cow 35.9, dog 50.6,
+sheep 51.2) could seed the same confirmation-bias spiral from a different initial error, so
+any use has to be confidence-gated per patch and per class, and gone by roughly epoch 1. The
+decisive offline measurement, accuracy versus retained fraction of k-NN-92 labels against the
+epoch-0/1/19 teacher on the unlabeled set (which carries ground truth as `mask_u_gt`), had
+not been run as of 2026-09-03; the idea was carried forward on 2026-09-04 as the
+`--abstention` referee gate.
+
+### Caveats
+
+One seed pair (12000), one layer (11) where the DPT reads four, $k = 20$, purity 0.75,
+patch-level boundary penalty on every absolute IoU.
