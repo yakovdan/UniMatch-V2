@@ -578,6 +578,35 @@ def test_controls_at_the_checkpoint_random_is_idle_and_flip_fires_everywhere(tmp
     assert st['grad/pla_norm_kept_x'] < 0.05 and st['grad/pla_norm_kept_s'] < 0.05  # so flip leaves ~no gradient
 
 
+def test_random_control_never_moves_a_tensor_the_counterfactual_never_reaches(tmp_path):
+    run = Run(tmp_path)
+    fr, nb = run.frozen, run.n_backbone
+    ckpt = os.path.join(str(tmp_path), 'bb.pth')
+    gx_views, gs_views = synthetic_halves(run)
+    mt = fr.names.index('mask_token')  # in the embed group, reached by no loss: f = 0 and g = 0 there in a real step
+    assert fr.groups[mt] == 'embed' and fr.group_idx['embed'][0] != mt  # not alone in its group
+    ref = FrozenGrad(run.model, 'dinov2_small', ckpt, control_seed=0)  # twin with f nonzero on mask_token
+    ref.flat_x.copy_(fr.flat_x)
+    ref.flat_s.copy_(fr.flat_s)
+    rx, rs_ = clones(gx_views), clones(gs_views)
+    ref.align(rx, rs_, run.params[:nb], 'both', 'random')
+    fr.acc_x[mt].zero_(); fr.acc_s[mt].zero_()
+    gx_views[mt].zero_(); gs_views[mt].zero_()
+    gx0, gs0 = clones(gx_views), clones(gs_views)
+    before_x, before_s = group_dots(fr, gx0, fr.acc_x), group_dots(fr, gs0, fr.acc_s)
+    st = fr.align(gx_views, gs_views, run.params[:nb], 'both', 'random')
+    assert st['grad/pla_fired_x/embed'] + st['grad/pla_fired_s/embed'] == 1.0  # the sign pattern: one half fires
+    assert torch.equal(gx_views[mt], torch.zeros_like(gx_views[mt])) and torch.equal(gs_views[mt], torch.zeros_like(gs_views[mt]))
+    for tag, before, views, f_views in (('x', before_x, gx_views, fr.acc_x), ('s', before_s, gs_views, fr.acc_s)):
+        if st['grad/pla_fired_%s/embed' % tag]:
+            d, ff, gg = before['embed']
+            assert group_dots(fr, views, f_views)['embed'][2] == pytest.approx(gg - d * d / ff, rel=1e-5)  # norm still exact
+            assert any(not torch.equal(views[i], (gx0 if tag == 'x' else gs0)[i]) for i in fr.group_idx['embed'] if i != mt)
+    # the draw happened anyway: the generator advanced exactly as in the twin whose f reaches mask_token
+    assert torch.equal(fr.gen.get_state(), ref.gen.get_state())
+    assert not torch.equal(rx[mt], torch.zeros_like(rx[mt])) or not torch.equal(rs_[mt], torch.zeros_like(rs_[mt]))
+
+
 def test_control_seed_reproduces_and_distinguishes_the_random_directions(tmp_path):
     run = Run(tmp_path)
     fr, nb = run.frozen, run.n_backbone

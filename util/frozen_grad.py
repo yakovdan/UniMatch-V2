@@ -167,14 +167,20 @@ class FrozenGrad:
             emit('/' + g, acc[self.group_idx[g]].sum(0))
         return out
 
-    def _random_displace(self, g_views, idx, m, gg, gg_after):
+    def _random_displace(self, g_views, f_views, idx, m, gg, gg_after):
         r"""The ``'random'`` control on one fired group: $g \leftarrow g - m\,r/\|r\|$ for a Gaussian
         $r$ over the group's concatenated tensors (one normalisation for the whole group; per-tensor
         unit vectors would total $\sqrt{\#\text{tensors}}$ and lean toward the small tensors, biases
         and LayerNorm weights), then $g \leftarrow g\,\sqrt{\texttt{gg\_after}/\|g\|^2}$ so the
-        final norm is the projection's exactly. Returns $\cos(g, r)$ of the undisplaced $g$."""
+        final norm is the projection's exactly. A tensor the counterfactual never reaches ($f \equiv 0$:
+        ``mask_token`` in the embed group) is one the projection can never move, so $r$ is zeroed on it
+        after the draw (drawn anyway, so the generator advances identically whatever $f$ is).
+        Returns $\cos(g, r)$ of the undisplaced $g$."""
         rs = [torch.randn(g_views[i].shape, device=g_views[i].device, dtype=torch.float32, generator=self.gen)
               for i in idx]
+        for r, i in zip(rs, idx):
+            if not f_views[i].any():  # f never reaches this tensor: PLA cannot move it, nor should r
+                r.zero_()
         rn = math.sqrt(sum((r * r).sum(dtype=torch.float64) for r in rs).item())
         gr = sum((g_views[i] * r).sum(dtype=torch.float64) for i, r in zip(idx, rs)).item()
         for i, r in zip(idx, rs):
@@ -245,7 +251,7 @@ class FrozenGrad:
                     gg_after = max(gg - d * d / ff, 0.0)  # the projection's ||g'||^2; every control lands on it too
                     if control == 'random':
                         out['grad/pla_ctrl_cos_gr/%s/%s' % (tag, grp)] = self._random_displace(
-                            g_views, idx, abs(d) / math.sqrt(ff), gg, gg_after)
+                            g_views, f_views, idx, abs(d) / math.sqrt(ff), gg, gg_after)
                     else:  # 'none' and 'flip': project along f
                         coef = d / ff
                         for i in idx:
