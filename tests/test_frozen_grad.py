@@ -1,7 +1,8 @@
 """Tests for --frozen-grad: the Complementary Dropout mask reuse in DPT.forward, the unsup_loss
 extraction out of unsup_forward_backward, and util/frozen_grad.py (identity with the student's
 own backbone gradient while the student still sits at the checkpoint, no side effects on the
-model / .grad / RNG, parameter grouping, the locked-backbone case, flag and env override).
+model / .grad / RNG, parameter grouping, the locked-backbone case, flag and env override), --pla
+(FrozenGrad.align) and its matched controls (--pla-control random / flip).
 
 The decisive check is the identity one: with the student's backbone loaded from the same
 checkpoint as the frozen copy, the counterfactual gradient IS the student's backbone gradient,
@@ -360,29 +361,38 @@ def test_align_fires_nothing_at_the_checkpoint(tmp_path):
     assert len(st) == 2 * len(run.frozen.group_names) + 4
 
 
-@pytest.mark.parametrize('target', ['both', 'sup', 'unsup'])
-def test_align_projects_exactly_the_opposing_groups(tmp_path, target):
-    run = Run(tmp_path)
+def synthetic_halves(run, seed=7, noise=0.1):
+    """Random g / f buffers with a known sign pattern -- odd groups oppose in x, even groups oppose in s,
+    |cos(g, f)| ~ 1 / sqrt(1 + noise^2) -- and .grad = g_x + g_s as the trainer leaves it before align.
+    Returns (gx_views, gs_views); gx_views are the run's flat supervised buffer."""
     fr = run.frozen
-    gen = torch.Generator(device='cuda').manual_seed(7)
+    gen = torch.Generator(device='cuda').manual_seed(seed)
     nb = run.n_backbone
     gx_views, gs_views = run.grad_x_acc[:nb], flat_views(torch.zeros_like(run.flat_x), run.params)[:nb]
     for views in (gx_views, gs_views, fr.acc_x, fr.acc_s):
         for v in views:
             v.copy_(torch.randn(v.shape, generator=gen, device='cuda'))
-    # force a known sign pattern: odd groups oppose in x, even groups oppose in s
     for k, grp in enumerate(fr.group_names):
         for i in fr.group_idx[grp]:
             if k % 2 == 1:
-                gx_views[i].copy_(-fr.acc_x[i] + 0.1 * torch.randn(gx_views[i].shape, generator=gen, device='cuda'))
+                gx_views[i].copy_(-fr.acc_x[i] + noise * torch.randn(gx_views[i].shape, generator=gen, device='cuda'))
             else:
-                gx_views[i].copy_(fr.acc_x[i] + 0.1 * torch.randn(gx_views[i].shape, generator=gen, device='cuda'))
+                gx_views[i].copy_(fr.acc_x[i] + noise * torch.randn(gx_views[i].shape, generator=gen, device='cuda'))
             if k % 2 == 0:
-                gs_views[i].copy_(-fr.acc_s[i] + 0.1 * torch.randn(gs_views[i].shape, generator=gen, device='cuda'))
+                gs_views[i].copy_(-fr.acc_s[i] + noise * torch.randn(gs_views[i].shape, generator=gen, device='cuda'))
             else:
-                gs_views[i].copy_(fr.acc_s[i] + 0.1 * torch.randn(gs_views[i].shape, generator=gen, device='cuda'))
+                gs_views[i].copy_(fr.acc_s[i] + noise * torch.randn(gs_views[i].shape, generator=gen, device='cuda'))
     for p, gx, gs in zip(run.params[:nb], gx_views, gs_views):
         p.grad = gx + gs
+    return gx_views, gs_views
+
+
+@pytest.mark.parametrize('target', ['both', 'sup', 'unsup'])
+def test_align_projects_exactly_the_opposing_groups(tmp_path, target):
+    run = Run(tmp_path)
+    fr = run.frozen
+    nb = run.n_backbone
+    gx_views, gs_views = synthetic_halves(run)
     before_x, before_s = group_dots(fr, gx_views, fr.acc_x), group_dots(fr, gs_views, fr.acc_s)
     gx0 = [v.clone() for v in gx_views]; gs0 = [v.clone() for v in gs_views]
     st = fr.align(gx_views, gs_views, run.params[:nb], target)
@@ -476,3 +486,142 @@ def test_pla_flags_env_and_validation():
             apply_env_overrides(parser.parse_args(REQUIRED), log)
     finally:
         del os.environ['PLA_TARGET']
+
+
+# ----------------------------------------------------------------------------
+# --pla-control: matched controls of the projection
+# ----------------------------------------------------------------------------
+
+def clones(views):
+    return [v.clone() for v in views]
+
+
+def group_numel(fr, grp):
+    return sum(fr.numels[i] for i in fr.group_idx[grp])
+
+
+@pytest.mark.parametrize('noise', [0.1, 3.0])  # |cos(g, f)| ~ 0.995 and ~ 0.3
+def test_random_control_matches_the_projection_except_in_direction(tmp_path, noise):
+    run = Run(tmp_path)
+    fr, nb = run.frozen, run.n_backbone
+    gx_views, gs_views = synthetic_halves(run, noise=noise)
+    gx0, gs0 = clones(gx_views), clones(gs_views)
+    px, ps = clones(gx_views), clones(gs_views)
+    st_pla = fr.align(px, ps, run.params[:nb], 'both', 'none')  # the projection itself, on copies
+    for p, gx, gs in zip(run.params[:nb], gx_views, gs_views):
+        p.grad = gx + gs  # as the trainer leaves it before align (the call above rewrote it)
+    cpu_state, cuda_state = torch.get_rng_state(), torch.cuda.get_rng_state()
+    st = fr.align(gx_views, gs_views, run.params[:nb], 'both', 'random')
+    # seed pairing: the private generator paid for the random directions, not the global streams
+    assert torch.equal(torch.get_rng_state(), cpu_state) and torch.equal(torch.cuda.get_rng_state(), cuda_state)
+    for tag, views0, views, pviews, f_views in (('x', gx0, gx_views, px, fr.acc_x), ('s', gs0, gs_views, ps, fr.acc_s)):
+        before, after, pafter = group_dots(fr, views0, f_views), group_dots(fr, views, f_views), group_dots(fr, pviews, f_views)
+        for grp in fr.group_names:
+            d, ff, gg = before[grp]
+            d2, _, gg2 = after[grp]
+            fired = st['grad/pla_fired_%s/%s' % (tag, grp)]
+            assert fired == st_pla['grad/pla_fired_%s/%s' % (tag, grp)] == float(d < 0)  # the same firing set
+            key = 'grad/pla_ctrl_cos_gr/%s/%s' % (tag, grp)
+            if not fired:
+                assert key not in st
+                for i in fr.group_idx[grp]:
+                    assert torch.equal(views0[i], views[i])
+                continue
+            # the projection's final norm, exactly ...
+            assert gg2 == pytest.approx(pafter[grp][2], rel=1e-5) and gg2 == pytest.approx(gg - d * d / ff, rel=1e-5)
+            # ... but the direction is uninformative: still opposing f, where the projection is orthogonal to it
+            assert d2 < 0 and abs(pafter[grp][0]) < 1e-6 * (ff * gg) ** 0.5
+            # displacement length ||g|| |cos(g, f)|: g' = s (g - m r) with r nearly orthogonal to g gives
+            # cos(g', g) = 1 / sqrt(1 + cos^2(g, f)) up to O(1 / sqrt(numel)), whatever the rescale s
+            c2 = d * d / (ff * gg)
+            dot = sum(float((views0[i].double() * views[i].double()).sum()) for i in fr.group_idx[grp])
+            assert dot / (gg * gg2) ** 0.5 == pytest.approx(1 / (1 + c2) ** 0.5, abs=min(0.3, 10 / group_numel(fr, grp) ** 0.5))
+            # the diagnostic: a random direction in numel dimensions
+            assert abs(st[key]) < 6 / group_numel(fr, grp) ** 0.5
+        assert st['grad/pla_fired_%s_frac' % tag] == st_pla['grad/pla_fired_%s_frac' % tag]
+        assert st['grad/pla_norm_kept_%s' % tag] == pytest.approx(st_pla['grad/pla_norm_kept_%s' % tag], rel=1e-5)
+    for p, gx, gs in zip(run.params[:nb], gx_views, gs_views):
+        torch.testing.assert_close(p.grad, gx + gs)
+
+
+def test_flip_control_removes_the_aligned_component(tmp_path):
+    run = Run(tmp_path)
+    fr, nb = run.frozen, run.n_backbone
+    gx_views, gs_views = synthetic_halves(run)
+    gx0, gs0 = clones(gx_views), clones(gs_views)
+    st = fr.align(gx_views, gs_views, run.params[:nb], 'both', 'flip')
+    assert not any(k.startswith('grad/pla_ctrl_cos_gr/') for k in st)
+    for tag, views0, views, f_views in (('x', gx0, gx_views, fr.acc_x), ('s', gs0, gs_views, fr.acc_s)):
+        before, after = group_dots(fr, views0, f_views), group_dots(fr, views, f_views)
+        for grp in fr.group_names:
+            d, ff, gg = before[grp]
+            d2, _, gg2 = after[grp]
+            assert st['grad/pla_fired_%s/%s' % (tag, grp)] == float(d > 0)  # the complementary firing set
+            if d > 0:
+                assert abs(d2) < 1e-6 * (ff * gg) ** 0.5 and gg2 == pytest.approx(gg - d * d / ff, rel=1e-5)
+            else:
+                for i in fr.group_idx[grp]:
+                    assert torch.equal(views0[i], views[i])
+    for p, gx, gs in zip(run.params[:nb], gx_views, gs_views):
+        torch.testing.assert_close(p.grad, gx + gs)
+
+
+def test_controls_at_the_checkpoint_random_is_idle_and_flip_fires_everywhere(tmp_path):
+    run = Run(tmp_path)
+    run.step()
+    nb = run.n_backbone
+    gx, gs = run.backbone_grads()
+    st = run.frozen.align(clones(gx), clones(gs), run.params[:nb], 'both', 'random')
+    assert st['grad/pla_fired_x_frac'] == 0.0 and st['grad/pla_fired_s_frac'] == 0.0  # cos = 1: nothing opposes
+    st = run.frozen.align(clones(gx), clones(gs), run.params[:nb], 'both', 'flip')
+    assert st['grad/pla_fired_x_frac'] == 1.0 and st['grad/pla_fired_s_frac'] == 1.0  # ... and everything is aligned,
+    assert st['grad/pla_norm_kept_x'] < 0.05 and st['grad/pla_norm_kept_s'] < 0.05  # so flip leaves ~no gradient
+
+
+def test_control_seed_reproduces_and_distinguishes_the_random_directions(tmp_path):
+    run = Run(tmp_path)
+    fr, nb = run.frozen, run.n_backbone
+    gx_views, gs_views = synthetic_halves(run)
+    ckpt = os.path.join(str(tmp_path), 'bb.pth')
+    assert fr.gen.initial_seed() == 0  # the default control seed
+    outs = []
+    for seed in (0, 0, 1):
+        twin = FrozenGrad(run.model, 'dinov2_small', ckpt, control_seed=seed)
+        twin.flat_x.copy_(fr.flat_x)
+        twin.flat_s.copy_(fr.flat_s)
+        gx, gs = clones(gx_views), clones(gs_views)
+        st = twin.align(gx, gs, run.params[:nb], 'both', 'random')
+        outs.append((gx + gs, st))
+    (a, sa), (b, sb), (c, sc) = outs
+    assert all(torch.equal(u, v) for u, v in zip(a, b)) and sa == sb  # same seed: bitwise the same run
+    assert not all(torch.equal(u, v) for u, v in zip(a, c))  # another seed: other directions ...
+    assert list(sa) == list(sc) and sa != sc  # ... on the same firing set (same keys), other cos(g, r)
+
+
+def test_pla_control_flags_env_and_validation():
+    import logging
+    log = logging.getLogger('t')
+    args = parser.parse_args(REQUIRED)
+    assert args.pla_control == 'none' and args.pla_control_seed == 0
+    args = parser.parse_args(REQUIRED + ['--pla', '--pla-control', 'random', '--pla-control-seed', '3'])
+    assert args.pla_control == 'random' and args.pla_control_seed == 3
+    check_unlock_after(args, {'lock_backbone': False})
+    check_unlock_after(parser.parse_args(REQUIRED + ['--pla', '5', '--pla-control', 'flip']), {'lock_backbone': False})
+    with pytest.raises(ValueError):  # a control of --pla: meaningless without it
+        check_unlock_after(parser.parse_args(REQUIRED + ['--pla-control', 'random']), {'lock_backbone': False})
+    with pytest.raises(SystemExit):  # not a choice
+        parser.parse_args(REQUIRED + ['--pla', '--pla-control', 'shuffle'])
+    args = parser.parse_args(REQUIRED + ['--pla'])
+    os.environ.update({'PLA_CONTROL': 'flip', 'PLA_CONTROL_SEED': '11'})
+    try:
+        apply_env_overrides(args, log)
+    finally:
+        for k in ('PLA_CONTROL', 'PLA_CONTROL_SEED'):
+            del os.environ[k]
+    assert args.pla_control == 'flip' and args.pla_control_seed == 11
+    os.environ['PLA_CONTROL'] = 'shuffle'
+    try:
+        with pytest.raises(ValueError):
+            apply_env_overrides(parser.parse_args(REQUIRED), log)
+    finally:
+        del os.environ['PLA_CONTROL']

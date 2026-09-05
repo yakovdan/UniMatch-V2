@@ -21,7 +21,9 @@ no RNG: DINOv2 has no stochastic layer at drop rate 0 and the dropout mask is re
 stream and every seed pairing are untouched. The head's own gradient under the frozen features is
 never materialised (``autograd.grad`` asks for the frozen parameters only).
 
-``--pla`` (pairwise layer-wise alignment) turns the diagnostic into a rule: see ``FrozenGrad.align``.
+``--pla`` (pairwise layer-wise alignment) turns the diagnostic into a rule: see ``FrozenGrad.align``;
+``--pla-control`` replaces the rule by a matched control (same firing set, displacement length and
+final norm, random direction) that tests whether the reference's *direction* carries the effect.
 """
 import math
 import re
@@ -62,7 +64,7 @@ class FrozenGrad:
     parameter views line up with ``grad_x_acc[:n_backbone]`` when the backbone is trainable.
     """
 
-    def __init__(self, model, backbone_name, ckpt_path, device='cuda'):
+    def __init__(self, model, backbone_name, ckpt_path, device='cuda', control_seed=0):
         self.bb = DINOv2(model_name=backbone_name.split('_')[-1])
         self.bb.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
         self.bb = self.bb.to(device).eval()  # no BN / dropout in DINOv2 at drop rate 0: eval == train
@@ -81,6 +83,10 @@ class FrozenGrad:
         self.flat_x = torch.zeros(D, device=device)
         self.flat_s = torch.zeros(D, device=device)
         self.acc_x, self.acc_s = self._views(self.flat_x), self._views(self.flat_s)
+        # private generator for the --pla-control random directions: never the global CUDA stream, so
+        # Complementary Dropout, CutMix and the augmentations stay in step with the seed-paired baseline
+        self.gen = torch.Generator(device=device)
+        self.gen.manual_seed(control_seed)
 
     def _views(self, flat):
         views, off = [], 0
@@ -161,8 +167,27 @@ class FrozenGrad:
             emit('/' + g, acc[self.group_idx[g]].sum(0))
         return out
 
+    def _random_displace(self, g_views, idx, m, gg, gg_after):
+        r"""The ``'random'`` control on one fired group: $g \leftarrow g - m\,r/\|r\|$ for a Gaussian
+        $r$ over the group's concatenated tensors (one normalisation for the whole group; per-tensor
+        unit vectors would total $\sqrt{\#\text{tensors}}$ and lean toward the small tensors, biases
+        and LayerNorm weights), then $g \leftarrow g\,\sqrt{\texttt{gg\_after}/\|g\|^2}$ so the
+        final norm is the projection's exactly. Returns $\cos(g, r)$ of the undisplaced $g$."""
+        rs = [torch.randn(g_views[i].shape, device=g_views[i].device, dtype=torch.float32, generator=self.gen)
+              for i in idx]
+        rn = math.sqrt(sum((r * r).sum(dtype=torch.float64) for r in rs).item())
+        gr = sum((g_views[i] * r).sum(dtype=torch.float64) for i, r in zip(idx, rs)).item()
+        for i, r in zip(idx, rs):
+            g_views[i].sub_((m / rn) * r)
+        cur2 = sum((g_views[i] * g_views[i]).sum(dtype=torch.float64) for i in idx).item()
+        if cur2 > 0.0:
+            s = math.sqrt(gg_after / cur2)
+            for i in idx:
+                g_views[i].mul_(s)
+        return gr / (math.sqrt(gg) * rn) if gg > 0.0 and rn > 0.0 else float('nan')
+
     @torch.no_grad()
-    def align(self, grad_x_views, grad_s_views, params, target='both'):
+    def align(self, grad_x_views, grad_s_views, params, target='both', control='none'):
         r"""Pairwise layer-wise alignment (``--pla``). For every parameter group $\ell$ and every
         half $h \in \{x, s\}$ selected by ``target`` (supervised against the frozen supervised
         gradient, unsupervised against the frozen unsupervised one), if
@@ -179,7 +204,26 @@ class FrozenGrad:
         groups only (skipping those without a gradient, i.e. under the --unlock-after lock), so a
         step where nothing fires is bitwise identical to the same step without the flag. Returns the W&B
         ``grad/pla_*`` dict: per half and group ``fired`` (0/1), the fraction of groups fired,
-        and the kept norm $\|g'\|/\|g\|$ of the half over the whole backbone."""
+        and the kept norm $\|g'\|/\|g\|$ of the half over the whole backbone.
+
+        ``control`` (``--pla-control``) replaces the rule by a matched control; ``'none'`` is the rule
+        above, whose arithmetic is left untouched.
+
+        ``'random'``: same firing test; the fired half is displaced by the length the projection would
+        remove, $|\langle g, f\rangle| / \|f\| = \|g\|\,|\cos|$, along a random unit vector $r$ over
+        the group's whole parameter space (all its tensors concatenated, fp32, drawn from the private
+        generator ``self.gen`` so the global RNG streams are untouched), then rescaled to the
+        projection's post-update norm $\|g\|\sqrt{1-\cos^2}$. Firing set, displacement length and
+        final norm match ``'none'`` on the same step; only the direction carries no information. Adds
+        ``grad/pla_ctrl_cos_gr/<half>/<group>``, $\cos(g, r)$ of the *undisplaced* $g$: expected
+        $\sim 1/\sqrt{\text{numel}}$ of the group ($10^{-3}$ for a block, $0.04$ for the 768-parameter
+        final norm); values of order $0.1$ on a block mean the direction is wrong or reused.
+
+        ``'flip'``: project along $f$ when $\langle g, f\rangle > 0$ instead, removing the *aligned*
+        component. The same operation with the opposite information, but a different firing set, so a
+        looser control than ``'random'``; at the checkpoint every group has $\cos = 1$, so it fires
+        everywhere and leaves the backbone almost no gradient on the first steps."""
+        assert control in ('none', 'random', 'flip'), control
         n = len(self.params)
         assert len(grad_x_views) == n == len(grad_s_views) == len(params)
         halves = [(t, gv, fv) for t, gv, fv in (('x', grad_x_views, self.acc_x), ('s', grad_s_views, self.acc_s))
@@ -193,13 +237,20 @@ class FrozenGrad:
                 ff = sum((f_views[i] * f_views[i]).sum(dtype=torch.float64) for i in idx)
                 gg = sum((g_views[i] * g_views[i]).sum(dtype=torch.float64) for i in idx)
                 d, ff, gg = d.item(), ff.item(), gg.item()
-                fire = d < 0.0 and ff > 0.0
+                if control == 'flip':
+                    fire = d > 0.0 and ff > 0.0
+                else:
+                    fire = d < 0.0 and ff > 0.0
                 if fire:
-                    coef = d / ff
-                    for i in idx:
-                        g_views[i].sub_(coef * f_views[i])
+                    gg_after = max(gg - d * d / ff, 0.0)  # the projection's ||g'||^2; every control lands on it too
+                    if control == 'random':
+                        out['grad/pla_ctrl_cos_gr/%s/%s' % (tag, grp)] = self._random_displace(
+                            g_views, idx, abs(d) / math.sqrt(ff), gg, gg_after)
+                    else:  # 'none' and 'flip': project along f
+                        coef = d / ff
+                        for i in idx:
+                            g_views[i].sub_(coef * f_views[i])
                     touched.update(idx)
-                    gg_after = max(gg - d * d / ff, 0.0)
                 else:
                     gg_after = gg
                 fired += int(fire)

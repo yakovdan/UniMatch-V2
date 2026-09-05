@@ -120,6 +120,20 @@ parser.add_argument('--pla', type=int, nargs='?', const=0, default=None, metavar
 parser.add_argument('--pla-target', type=str, default='both', choices=['both', 'sup', 'unsup'],
                     help='with --pla: which half to align -- both (default), only the supervised gradient or only '
                          'the unsupervised one [env: PLA_TARGET]')
+parser.add_argument('--pla-control', type=str, default='none', choices=['none', 'random', 'flip'],
+                    help="with --pla: replace the projection by a matched control (util/frozen_grad.py "
+                         "FrozenGrad.align). 'random': same firing set, same displacement length and same final "
+                         "norm as the projection on every step, but along a random direction drawn from a private "
+                         "RNG (the global data / dropout streams are untouched, so the run stays seed-paired with "
+                         "its --pla twin); tests whether the DIRECTION of the frozen reference carries the effect. "
+                         "Logs grad/pla_ctrl_cos_gr/<half>/<group>, cos(g, r) before the displacement, expected "
+                         "~1/sqrt(group size) (1e-3 per block). 'flip': project when <g,f> > 0 instead, removing the "
+                         "ALIGNED component; a different firing set, and at the checkpoint (cos = 1 everywhere) it "
+                         "fires on every group and leaves the backbone almost no gradient, so it is a looser control "
+                         "than random [env: PLA_CONTROL]")
+parser.add_argument('--pla-control-seed', type=int, default=0,
+                    help='seed of the private RNG behind --pla-control random; independent of --seed, so the same '
+                         '--seed with another value re-draws only the random directions [env: PLA_CONTROL_SEED]')
 parser.add_argument('--eval-every-iter', action='store_true',
                     help='evaluate the student and the EMA teacher on val after EVERY optimizer step (the same '
                          'evaluation the epoch end runs), logged as eval_iter/* under the iters step metric and '
@@ -263,6 +277,8 @@ def check_unlock_after(args, cfg):
         raise ValueError('--pla aligns the backbone gradient; there is none under --lock-backbone / lock_backbone: True')
     if args.pla is not None and args.sup_only and args.pla_target == 'unsup':
         raise ValueError('--pla-target unsup has no unsupervised gradient to align under --sup-only')
+    if args.pla_control != 'none' and args.pla is None:
+        raise ValueError('--pla-control %s is a control of --pla and requires it' % args.pla_control)
     if args.eval_every_iter_images < 0:
         raise ValueError('--eval-every-iter-images N must be >= 0 (got %d); 0 = the whole val set' % args.eval_every_iter_images)
 
@@ -390,6 +406,8 @@ ENV_OVERRIDES = (
     ('FROZEN_GRAD', 'frozen_grad', boolean, None),
     ('PLA', 'pla', int, None),  # K epochs; 0 = the whole run (the old on/off spelling PLA=true is refused)
     ('PLA_TARGET', 'pla_target', str, ('both', 'sup', 'unsup')),
+    ('PLA_CONTROL', 'pla_control', str, ('none', 'random', 'flip')),
+    ('PLA_CONTROL_SEED', 'pla_control_seed', int, None),
     ('EVAL_EVERY_ITER', 'eval_every_iter', boolean, None),
     ('EVAL_EVERY_ITER_IMAGES', 'eval_every_iter_images', int, None),
     ('LR', 'lr', float, None),
@@ -780,7 +798,6 @@ def main():
     accum = EFFECTIVE_BATCH // cfg['batch_size']
 
     all_args = {**cfg, **vars(args), 'ngpus': world_size, 'accum_steps': accum}
-    logger.info('{}\n'.format(pprint.pformat(all_args)))
 
     os.makedirs(args.save_path, exist_ok=True)
 
@@ -811,7 +828,8 @@ def main():
         dir=args.save_path,
         mode=wandb_mode,
         id=run_id,
-        resume='allow'
+        resume='allow',
+        tags=['pla_control:' + args.pla_control] if args.pla_control != 'none' else None,
     )
     # train/* and grad/* are logged per optimizer step, eval/* per epoch
     wandb.define_metric('iters')
@@ -819,6 +837,9 @@ def main():
     wandb.define_metric('train/*', step_metric='iters')
     wandb.define_metric('grad/*', step_metric='iters')
     wandb.define_metric('eval/*', step_metric='epoch')
+    # after wandb.init: W&B's console capture (output.log) starts there, and the header has to be in it
+    # as well as in the entrypoint's tee'd train_*.log -- bf16, seed, pla, pla_target, pla_control ...
+    logger.info('{}\n'.format(pprint.pformat(all_args)))
 
     model_configs = {
         'small': {'encoder_size': 'small', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -873,7 +894,8 @@ def main():
     # referee: after the DPT, before the epoch loop; absent the flag nothing here runs.
     frozen = None
     if args.frozen_grad or args.pla is not None:
-        frozen = FrozenGrad(model, cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth')
+        frozen = FrozenGrad(model, cfg['backbone'], f'./pretrained/{cfg["backbone"]}.pth',
+                            control_seed=args.pla_control_seed)
         logger.info('frozen-grad: counterfactual gradient of the frozen pretrained %s under the current head, '
                     'every micro-batch (one extra forward+backward each); %d parameter groups: %s; never applied\n'
                     % (cfg['backbone'], len(frozen.group_names), ' '.join(frozen.group_names)))
@@ -1061,9 +1083,13 @@ def main():
         else:
             pla_window = 'the first %d of %d epochs (%d of %d optimizer steps)' % (
                 args.pla, cfg['epochs'], args.pla * steps_per_epoch, total_steps)
+        pla_ctrl = {'none': '',
+                    'random': ' -- CONTROL random (seed %d): same firing set, displacement length and final norm as '
+                              'the projection, random direction' % args.pla_control_seed,
+                    'flip': ' -- CONTROL flip: fires when <g,f> > 0 and removes the aligned component'}[args.pla_control]
         logger.info('pla: pairwise layer-wise alignment of the backbone gradient (%s) with the frozen counterfactual, '
-                    'per group, one-way PCGrad, %s; the frozen gradient is never applied%s\n' % (
-                        args.pla_target, pla_window,
+                    'per group, one-way PCGrad%s, %s; the frozen gradient is never applied%s\n' % (
+                        args.pla_target, pla_ctrl, pla_window,
                         '' if args.frozen_grad or args.pla == 0 or args.pla >= cfg['epochs']
                         else '; the counterfactual pass stops with it (add --frozen-grad to keep its diagnostics)'))
     if args.abstention > 0:
@@ -1307,7 +1333,7 @@ def main():
             # to its counterfactual, in the flat buffers and .grad, after the pre-alignment diagnostics
             # above and before GGR (which under --ggr-scope all/backbone then reads the aligned buffers)
             pla_stats = frozen.align(grad_x_acc[:n_backbone], grad_s_acc[:n_backbone], params[:n_backbone],
-                                     args.pla_target) if pla_active else {}
+                                     args.pla_target, args.pla_control) if pla_active else {}
 
             seen, n_seen = None, 0
             if proto is not None:
@@ -1425,10 +1451,13 @@ def main():
                                     frozen_stats['grad/frozen_norm_ratio_all'],
                                     ' '.join('%.3f' % frozen_stats['grad/frozen_cos/' + g] for g in frozen.group_names)))
                 if pla_active:
+                    ctrl_cos = [abs(v) for k, v in pla_stats.items() if k.startswith('grad/pla_ctrl_cos_gr/')]
                     logger.info('  pla: fired x {:.0f}/{} s {:.0f}/{} groups | kept norm x {:.3f} s {:.3f}'.format(
                         pla_stats.get('grad/pla_fired_x_frac', float('nan')) * len(frozen.group_names), len(frozen.group_names),
                         pla_stats.get('grad/pla_fired_s_frac', float('nan')) * len(frozen.group_names), len(frozen.group_names),
-                        pla_stats.get('grad/pla_norm_kept_x', float('nan')), pla_stats.get('grad/pla_norm_kept_s', float('nan'))))
+                        pla_stats.get('grad/pla_norm_kept_x', float('nan')), pla_stats.get('grad/pla_norm_kept_s', float('nan')))
+                        + (' | ctrl max |cos(g,r)| ' + ('{:.4f}'.format(max(ctrl_cos)) if ctrl_cos else '-')
+                           if args.pla_control == 'random' else ''))
 
             # smoke-test throughput: the clock starts once the epoch's warm-up steps are
             # done and is read at the stop below; a stop earlier than that prints no timing
